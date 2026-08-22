@@ -31,7 +31,7 @@ repositories {
 dependencies {
     // Paper & MC-Specific dependencies
     // Kept in step with the consumer plugins' Paper line (gradle/libs.versions.toml in the monorepo).
-    compileOnly("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    compileOnly("io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT")
 
     // DI — api, not implementation: the public surface exposes Guice types
     // (HiberniaModule extends AbstractModule, CommandManager takes an Injector).
@@ -48,7 +48,7 @@ dependencies {
     testAnnotationProcessor("org.projectlombok:lombok:1.18.34")
 
     // Testing
-    testImplementation("io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT")
+    testImplementation("io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT")
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
     testImplementation("org.mockito:mockito-core:5.14.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
