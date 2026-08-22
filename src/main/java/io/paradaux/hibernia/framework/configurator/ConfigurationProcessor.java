@@ -11,6 +11,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.RecordComponent;
 import java.lang.reflect.Type;
 import java.math.BigDecimal;
 import java.util.ArrayDeque;
@@ -18,9 +19,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
 import java.util.logging.Level;
 
 /**
@@ -32,9 +36,17 @@ import java.util.logging.Level;
  * the same code that populates a top-level component.</p>
  *
  * <p>Supported field types: {@code String}, the boxed and primitive numeric types,
- * {@code boolean}, {@link BigDecimal}, {@link Component} (parsed as MiniMessage), enums,
- * {@code List<T>}, {@code Map<K, V>} and any {@link ConfigurationObject} — with {@code T},
- * {@code K} and {@code V} themselves drawn from that same set.</p>
+ * {@code boolean}, {@link BigDecimal}, {@link UUID}, {@link Component} (parsed as MiniMessage),
+ * enums, {@code List<T>}, {@code Set<T>}, {@code Map<K, V>} and any {@link ConfigurationObject}
+ * — with {@code T}, {@code K} and {@code V} themselves drawn from that same set.</p>
+ *
+ * <h2>Records</h2>
+ * <p>A component or object may be a {@code record}. Records cannot be field-injected — their
+ * fields are final — so they are <em>constructed</em> instead: each component is read from the
+ * section and handed to the canonical constructor. That is the more faithful binding of the
+ * two, because a record's compact constructor runs as part of it, so validation and default
+ * normalisation written there apply to configured values exactly as they do to code-built
+ * ones.</p>
  */
 public class ConfigurationProcessor {
 
@@ -57,9 +69,20 @@ public class ConfigurationProcessor {
     /**
      * Inject configuration values into {@code target} from an arbitrary section — a file
      * root, or a subsection when binding a nested object.
+     *
+     * <p>Mutable types only. Use {@link #create(Class, ConfigurationSection)} to bind a type that
+     * may be a record.</p>
      */
     public void process(Object target, ConfigurationSection section) {
         bindFields(target, section, new ArrayDeque<>());
+    }
+
+    /**
+     * Build an instance of {@code type} from {@code section} — constructing it if it is a record,
+     * otherwise instantiating and field-injecting it.
+     */
+    public Object create(Class<?> type, ConfigurationSection section) {
+        return bindObject(type, section, new ArrayDeque<>());
     }
 
     private void bindFields(Object target, ConfigurationSection section, Deque<Class<?>> stack) {
@@ -115,6 +138,13 @@ public class ConfigurationProcessor {
 
         if (type == List.class) {
             return readList(section, path, generic, stack);
+        }
+
+        if (type == Set.class) {
+            Object list = readList(section, path, generic, stack);
+            return list instanceof List<?> values
+                    ? Collections.unmodifiableSet(new LinkedHashSet<>(values))
+                    : Set.of();
         }
 
         if (type == Map.class) {
@@ -228,22 +258,106 @@ public class ConfigurationProcessor {
             throw new IllegalStateException("Configuration nesting deeper than " + MAX_DEPTH
                     + " at " + type.getSimpleName() + " (" + describe(stack) + ")");
         }
+        stack.push(type);
+        try {
+            return type.isRecord()
+                    ? bindRecord(type, section, stack)
+                    : bindMutable(type, section, stack);
+        } finally {
+            stack.pop();
+        }
+    }
+
+    private Object bindMutable(Class<?> type, ConfigurationSection section, Deque<Class<?>> stack) {
         Object instance;
         try {
             Constructor<?> constructor = type.getDeclaredConstructor();
             constructor.setAccessible(true);
             instance = constructor.newInstance();
         } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("@ConfigurationObject " + type.getName()
+            throw new IllegalStateException(type.getName()
                     + " needs an accessible no-argument constructor", e);
         }
-        stack.push(type);
-        try {
-            bindFields(instance, section, stack);
-        } finally {
-            stack.pop();
-        }
+        bindFields(instance, section, stack);
         return instance;
+    }
+
+    /**
+     * Builds a record by reading each component and invoking the canonical constructor, so the
+     * record's own compact constructor gets to validate and normalise the configured values.
+     */
+    private Object bindRecord(Class<?> type, ConfigurationSection section, Deque<Class<?>> stack) {
+        RecordComponent[] components = type.getRecordComponents();
+        Class<?>[] parameterTypes = new Class<?>[components.length];
+        Object[] arguments = new Object[components.length];
+
+        for (int i = 0; i < components.length; i++) {
+            RecordComponent component = components[i];
+            parameterTypes[i] = component.getType();
+            ConfigurationValue annotation = annotationOf(type, component);
+            Object value = null;
+            if (annotation != null) {
+                String path = annotation.path().isEmpty() ? component.getName() : annotation.path();
+                try {
+                    value = readValue(section, path, annotation.defaultValue(),
+                            component.getType(), component.getGenericType(), stack);
+                } catch (RuntimeException e) {
+                    plugin.getLogger().log(Level.WARNING,
+                            "Failed to read config value '" + path + "' for "
+                                    + type.getSimpleName() + "." + component.getName()
+                                    + ": " + e.getMessage(), e);
+                }
+            }
+            arguments[i] = value != null ? value : defaultFor(component.getType());
+        }
+
+        try {
+            Constructor<?> canonical = type.getDeclaredConstructor(parameterTypes);
+            canonical.setAccessible(true);
+            return canonical.newInstance(arguments);
+        } catch (ReflectiveOperationException e) {
+            Throwable cause = e instanceof java.lang.reflect.InvocationTargetException ite
+                    ? ite.getTargetException() : e;
+            throw new IllegalStateException("Failed to construct record " + type.getName()
+                    + ": " + cause.getMessage(), cause);
+        }
+    }
+
+    /**
+     * A record component's {@code @ConfigurationValue}, taken from the component declaration or,
+     * failing that, the backing field — which of the two carries it depends on the annotation's
+     * declared targets.
+     */
+    private static ConfigurationValue annotationOf(Class<?> type, RecordComponent component) {
+        ConfigurationValue annotation = component.getAnnotation(ConfigurationValue.class);
+        if (annotation != null) {
+            return annotation;
+        }
+        try {
+            return type.getDeclaredField(component.getName()).getAnnotation(ConfigurationValue.class);
+        } catch (NoSuchFieldException e) {
+            return null;
+        }
+    }
+
+    /**
+     * The value handed to a canonical constructor for an unconfigured component. A primitive
+     * cannot take null, and its zero value is what a record's compact constructor is written to
+     * normalise anyway.
+     */
+    private static Object defaultFor(Class<?> type) {
+        if (!type.isPrimitive()) {
+            return null;
+        }
+        if (type == boolean.class) return false;
+        if (type == char.class) return (char) 0;
+        if (type == int.class) return 0;
+        if (type == long.class) return 0L;
+        if (type == double.class) return 0d;
+        if (type == float.class) return 0f;
+        if (type == short.class) return (short) 0;
+        if (type == byte.class) return (byte) 0;
+        return null;
     }
 
     private static String describe(Deque<Class<?>> stack) {
@@ -293,6 +407,16 @@ public class ConfigurationProcessor {
             // Money and other exact-decimal values: never route through double. Read the raw scalar
             // (string or YAML number) and parse it losslessly, so 0.1 + 0.2 stays 0.3.
             return parseBigDecimal(config, path, defaultValue);
+        } else if (type == UUID.class) {
+            String raw = config.getString(path, defaultValue);
+            if (raw == null || raw.isBlank()) {
+                return null;
+            }
+            try {
+                return UUID.fromString(raw.trim());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid UUID '" + raw + "' for " + path);
+            }
         } else if (type == Component.class) {
             String raw = config.getString(path, defaultValue);
             return raw == null ? null : MiniMessage.miniMessage().deserialize(raw);

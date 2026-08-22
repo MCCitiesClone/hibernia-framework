@@ -10,7 +10,6 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.reflections.Reflections;
 
 import java.io.File;
-import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -163,11 +162,12 @@ public class ConfigurationLoader {
         this.components = Map.copyOf(rebuilt);
     }
 
-    /** Instantiate a component and bind it from whichever file and root path it declares. */
-    private Object build(Class<?> componentClass) throws Exception {
-        Object instance = instantiate(componentClass);
-        processor.process(instance, sectionFor(componentClass));
-        return instance;
+    /**
+     * Build a component from whichever file and root path it declares. Records are constructed
+     * through their canonical constructor; mutable components are instantiated and field-injected.
+     */
+    private Object build(Class<?> componentClass) {
+        return processor.create(componentClass, sectionFor(componentClass));
     }
 
     /**
@@ -211,11 +211,5 @@ public class ConfigurationLoader {
             }
         }
         return YamlConfiguration.loadConfiguration(file);
-    }
-
-    private Object instantiate(Class<?> componentClass) throws Exception {
-        Constructor<?> constructor = componentClass.getDeclaredConstructor();
-        constructor.setAccessible(true);
-        return constructor.newInstance();
     }
 }
