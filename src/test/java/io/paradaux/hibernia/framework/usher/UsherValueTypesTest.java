@@ -95,7 +95,7 @@ class UsherValueTypesTest {
 
     @Test
     void buttonSpec_requiresLabelAndKind() {
-        assertThrows(NullPointerException.class, () -> new ButtonSpec(null, null, 0, ButtonSpec.Kind.CLOSE, null));
+        assertThrows(NullPointerException.class, () -> new ButtonSpec(null, null, 0, ButtonSpec.Kind.CLOSE, null, null));
     }
 
     // ── DialogContext ─────────────────────────────────────────────────────────────

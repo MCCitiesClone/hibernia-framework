@@ -93,6 +93,26 @@ class NestedConfigurationTest {
         PermissionDefault c;
     }
 
+    static class IntKeyRoot {
+        @ConfigurationValue(path = "levels")
+        Map<Integer, String> levels;
+    }
+
+    @ConfigurationObject
+    static class NoCtor {
+        @ConfigurationValue(path = "value")
+        String value;
+
+        NoCtor(String required) {
+            this.value = required;
+        }
+    }
+
+    static class NoCtorRoot {
+        @ConfigurationValue(path = "bad")
+        NoCtor bad;
+    }
+
     @ConfigurationObject
     static class SelfReferential {
         @ConfigurationValue(path = "child")
@@ -265,6 +285,65 @@ class NestedConfigurationTest {
         processor.process(root, enums);
 
         assertNull(root.a);
+    }
+
+    @Test
+    void integerKeyedMapBindsAndSkipsNonNumericKeys() {
+        YamlConfiguration yaml = YamlConfiguration.loadConfiguration(new StringReader("""
+                levels:
+                  1: one
+                  2: two
+                  notanumber: three
+                """));
+        IntKeyRoot root = new IntKeyRoot();
+
+        processor.process(root, yaml);
+
+        assertEquals("one", root.levels.get(1));
+        assertEquals("two", root.levels.get(2));
+        assertEquals(2, root.levels.size());
+    }
+
+    @Test
+    void invalidEnumMapKeyIsSkippedRatherThanFailingTheWholeMap() {
+        YamlConfiguration yaml = YamlConfiguration.loadConfiguration(new StringReader("""
+                global:
+                  FOR_SALE:
+                    priority: 1
+                  NOT_A_STATE:
+                    priority: 2
+                """));
+        Root root = new Root();
+
+        processor.process(root, yaml);
+
+        assertEquals(1, root.global.size());
+        assertTrue(root.global.containsKey(State.FOR_SALE));
+    }
+
+    @Test
+    void nonMappingListEntryIsSkipped() {
+        YamlConfiguration yaml = YamlConfiguration.loadConfiguration(new StringReader("""
+                tags:
+                  - tag-id: fine
+                  - just-a-string
+                """));
+        Root root = new Root();
+
+        processor.process(root, yaml);
+
+        assertEquals(1, root.tags.size());
+        assertEquals("fine", root.tags.get(0).id);
+    }
+
+    @Test
+    void objectWithoutANoArgConstructorIsReported() {
+        YamlConfiguration yaml = YamlConfiguration.loadConfiguration(new StringReader("bad:\n  value: x\n"));
+        NoCtorRoot root = new NoCtorRoot();
+
+        processor.process(root, yaml);
+
+        assertNull(root.bad);
     }
 
     @Test
