@@ -1,17 +1,45 @@
 package io.paradaux.hibernia.framework.configurator;
 
+import io.paradaux.hibernia.framework.configurator.annotations.ConfigurationObject;
 import io.paradaux.hibernia.framework.configurator.annotations.ConfigurationValue;
-import org.bukkit.configuration.file.FileConfiguration;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.minimessage.MiniMessage;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.plugin.Plugin;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.math.BigDecimal;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.logging.Level;
 
+/**
+ * Binds YAML onto annotated POJOs.
+ *
+ * <p>Binding is recursive and section-relative: every step works against a Bukkit
+ * {@link ConfigurationSection} rather than the file root, which is what lets a
+ * {@link ConfigurationObject} nested inside a list, a map or another object be populated by
+ * the same code that populates a top-level component.</p>
+ *
+ * <p>Supported field types: {@code String}, the boxed and primitive numeric types,
+ * {@code boolean}, {@link BigDecimal}, {@link Component} (parsed as MiniMessage), enums,
+ * {@code List<T>}, {@code Map<K, V>} and any {@link ConfigurationObject} — with {@code T},
+ * {@code K} and {@code V} themselves drawn from that same set.</p>
+ */
 public class ConfigurationProcessor {
+
+    /** Depth guard: an anchor-built recursive graph would otherwise recurse until the stack ends. */
+    private static final int MAX_DEPTH = 16;
 
     private final Plugin plugin;
 
@@ -20,65 +48,235 @@ public class ConfigurationProcessor {
     }
 
     /**
-     * Process all annotated fields in the target object
-     *
-     * @param target The object to inject configuration values into
+     * Inject configuration values into {@code target} from the plugin's {@code config.yml}.
      */
     public void process(Object target) {
-        Class<?> clazz = target.getClass();
-        FileConfiguration config = plugin.getConfig();
-
-        // Get all declared fields (including private ones)
-        Field[] fields = clazz.getDeclaredFields();
-
-        Arrays.stream(fields)
-                .filter(field -> field.isAnnotationPresent(ConfigurationValue.class))
-                .forEach(field -> {
-                    ConfigurationValue annotation = field.getAnnotation(ConfigurationValue.class);
-                    String path = annotation.path();
-                    String defaultValue = annotation.defaultValue();
-
-                    try {
-                        // Make field accessible - this works in Java 9+ including Java 17
-                        boolean accessible = field.trySetAccessible();
-                        if (!accessible) {
-                            plugin.getLogger().warning("Cannot access field: " + field.getName() + " - skipping");
-                            return;
-                        }
-
-                        // Skip final fields
-                        if (Modifier.isFinal(field.getModifiers())) {
-                            plugin.getLogger().warning("Cannot inject config into final field: " + field.getName());
-                            return;
-                        }
-
-                        // Get value from config with appropriate type conversion
-                        Object value = getConfigValue(config, path, defaultValue, field.getType());
-                        if (value != null) {
-                            field.set(target, value);
-                        }
-                    } catch (Exception e) {
-                        // A bad value (unparseable number, unknown enum constant,
-                        // type mismatch) must name the path and field, with the
-                        // cause attached — not vanish into a generic message.
-                        plugin.getLogger().log(Level.WARNING,
-                                "Failed to inject config value '" + path + "' into "
-                                        + clazz.getSimpleName() + "." + field.getName() + ": " + e.getMessage(), e);
-                    }
-                });
+        process(target, plugin.getConfig());
     }
 
     /**
-     * Get value from config with type conversion
+     * Inject configuration values into {@code target} from an arbitrary section — a file
+     * root, or a subsection when binding a nested object.
      */
+    public void process(Object target, ConfigurationSection section) {
+        bindFields(target, section, new ArrayDeque<>());
+    }
+
+    private void bindFields(Object target, ConfigurationSection section, Deque<Class<?>> stack) {
+        Class<?> clazz = target.getClass();
+        for (Field field : clazz.getDeclaredFields()) {
+            ConfigurationValue annotation = field.getAnnotation(ConfigurationValue.class);
+            if (annotation == null) {
+                continue;
+            }
+            String path = annotation.path();
+            try {
+                if (!field.trySetAccessible()) {
+                    plugin.getLogger().warning("Cannot access field: " + field.getName() + " - skipping");
+                    continue;
+                }
+                if (Modifier.isFinal(field.getModifiers())) {
+                    plugin.getLogger().warning("Cannot inject config into final field: " + field.getName());
+                    continue;
+                }
+
+                Object value = readValue(section, path, annotation.defaultValue(),
+                        field.getType(), field.getGenericType(), stack);
+                if (value != null) {
+                    field.set(target, value);
+                }
+            } catch (Exception e) {
+                // A bad value (unparseable number, unknown enum constant, type mismatch) must
+                // name the path and field, with the cause attached — not vanish into a generic
+                // message.
+                plugin.getLogger().log(Level.WARNING,
+                        "Failed to inject config value '" + path + "' into "
+                                + clazz.getSimpleName() + "." + field.getName() + ": " + e.getMessage(), e);
+            }
+        }
+    }
+
+    /**
+     * Reads one value at {@code path}, dispatching on the declared type. {@code generic}
+     * carries the field's parameterised type so element types of lists and maps survive
+     * erasure.
+     */
+    private Object readValue(ConfigurationSection section, String path, String defaultValue,
+                             Class<?> type, Type generic, Deque<Class<?>> stack) {
+        if (isConfigurationObject(type)) {
+            ConfigurationSection child = section.getConfigurationSection(path);
+            if (child == null) {
+                // A missing optional object is a legitimate "not configured", not an error —
+                // a config that ships every section commented out is normal.
+                return null;
+            }
+            return bindObject(type, child, stack);
+        }
+
+        if (type == List.class) {
+            return readList(section, path, generic, stack);
+        }
+
+        if (type == Map.class) {
+            return readMap(section, path, generic, stack);
+        }
+
+        return readScalar(section, path, defaultValue, type);
+    }
+
+    private Object readList(ConfigurationSection section, String path, Type generic, Deque<Class<?>> stack) {
+        Class<?> element = typeArgument(generic, 0);
+        if (element == null || !isConfigurationObject(element)) {
+            // Scalar list: Bukkit's getStringList is the historical behaviour and stays.
+            return section.getStringList(path);
+        }
+        List<?> raw = section.getList(path);
+        if (raw == null) {
+            return List.of();
+        }
+        List<Object> bound = new ArrayList<>(raw.size());
+        for (int i = 0; i < raw.size(); i++) {
+            ConfigurationSection entry = asSection(section, path + "[" + i + "]", raw.get(i));
+            if (entry != null) {
+                bound.add(bindObject(element, entry, stack));
+            }
+        }
+        return List.copyOf(bound);
+    }
+
+    private Object readMap(ConfigurationSection section, String path, Type generic, Deque<Class<?>> stack) {
+        ConfigurationSection child = section.getConfigurationSection(path);
+        if (child == null) {
+            return Map.of();
+        }
+        Class<?> keyType = typeArgument(generic, 0);
+        Class<?> valueType = typeArgument(generic, 1);
+
+        Map<Object, Object> bound = new LinkedHashMap<>();
+        for (String key : child.getKeys(false)) {
+            Object mapKey = convertMapKey(key, keyType, path);
+            if (mapKey == null) {
+                continue;
+            }
+            Object mapValue;
+            if (valueType != null && isConfigurationObject(valueType)) {
+                ConfigurationSection valueSection = child.getConfigurationSection(key);
+                mapValue = valueSection == null ? null : bindObject(valueType, valueSection, stack);
+            } else {
+                mapValue = readScalar(child, key, "", valueType == null ? String.class : valueType);
+            }
+            if (mapValue != null) {
+                bound.put(mapKey, mapValue);
+            }
+        }
+        return Collections.unmodifiableMap(bound);
+    }
+
+    /** Map keys arrive as YAML strings; an enum-keyed map converts them, case-insensitively. */
+    private Object convertMapKey(String key, Class<?> keyType, String path) {
+        if (keyType == null || keyType == String.class) {
+            return key;
+        }
+        if (keyType.isEnum()) {
+            Object constant = matchEnum(keyType, key);
+            if (constant == null) {
+                plugin.getLogger().warning("Invalid key '" + key + "' under " + path
+                        + "; expected one of " + Arrays.toString(keyType.getEnumConstants()));
+            }
+            return constant;
+        }
+        if (keyType == Integer.class) {
+            try {
+                return Integer.valueOf(key.trim());
+            } catch (NumberFormatException e) {
+                plugin.getLogger().warning("Invalid integer key '" + key + "' under " + path);
+                return null;
+            }
+        }
+        return key;
+    }
+
+    /**
+     * A YAML list entry arrives as a {@code Map}, not a {@link ConfigurationSection}. Wrap it
+     * in a detached section so the same object binder handles it.
+     */
+    private ConfigurationSection asSection(ConfigurationSection parent, String where, Object entry) {
+        if (entry instanceof ConfigurationSection alreadySection) {
+            return alreadySection;
+        }
+        if (entry instanceof Map<?, ?> map) {
+            String temporaryKey = "hibernia$tmp$" + Integer.toHexString(System.identityHashCode(entry));
+            // createSection(path, map) converts nested maps into real sections all the way
+            // down; plain set() would store them as raw Maps that getConfigurationSection
+            // cannot see, silently nulling every object nested inside a list entry.
+            ConfigurationSection wrapper = parent.createSection(temporaryKey, map);
+            // Detach immediately: the wrapper exists only to bind from, and must never
+            // survive into a save of the operator's file.
+            parent.set(temporaryKey, null);
+            return wrapper;
+        }
+        plugin.getLogger().warning("Expected a mapping at " + where + " but found "
+                + (entry == null ? "nothing" : entry.getClass().getSimpleName()));
+        return null;
+    }
+
+    private Object bindObject(Class<?> type, ConfigurationSection section, Deque<Class<?>> stack) {
+        // A type may legitimately appear at more than one depth — a tree of like-typed
+        // groups is ordinary config — so recursion is bounded by depth, not by type. YAML
+        // parsed from a file is a finite tree; the guard exists for anchor-built graphs.
+        if (stack.size() >= MAX_DEPTH) {
+            throw new IllegalStateException("Configuration nesting deeper than " + MAX_DEPTH
+                    + " at " + type.getSimpleName() + " (" + describe(stack) + ")");
+        }
+        Object instance;
+        try {
+            Constructor<?> constructor = type.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            instance = constructor.newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("@ConfigurationObject " + type.getName()
+                    + " needs an accessible no-argument constructor", e);
+        }
+        stack.push(type);
+        try {
+            bindFields(instance, section, stack);
+        } finally {
+            stack.pop();
+        }
+        return instance;
+    }
+
+    private static String describe(Deque<Class<?>> stack) {
+        List<String> names = new ArrayList<>();
+        for (Class<?> type : stack) {
+            names.add(type.getSimpleName());
+        }
+        return String.join(" -> ", names);
+    }
+
+    private static boolean isConfigurationObject(Class<?> type) {
+        return type.isAnnotationPresent(ConfigurationObject.class);
+    }
+
+    /** The {@code index}-th type argument of a parameterised field type, or null when erased. */
+    private static Class<?> typeArgument(Type generic, int index) {
+        if (!(generic instanceof ParameterizedType parameterized)) {
+            return null;
+        }
+        Type[] arguments = parameterized.getActualTypeArguments();
+        if (index >= arguments.length) {
+            return null;
+        }
+        return arguments[index] instanceof Class<?> raw ? raw : null;
+    }
+
     @SuppressWarnings("unchecked")
-    private Object getConfigValue(FileConfiguration config, String path, String defaultValue, Class<?> type) {
+    private Object readScalar(ConfigurationSection config, String path, String defaultValue, Class<?> type) {
         if (!config.contains(path) && defaultValue.isEmpty()) {
             plugin.getLogger().warning("Configuration path not found: " + path);
             return null;
         }
 
-        // Handle different types
         if (type == String.class) {
             return config.getString(path, defaultValue);
         } else if (type == int.class || type == Integer.class) {
@@ -95,20 +293,39 @@ public class ConfigurationProcessor {
             // Money and other exact-decimal values: never route through double. Read the raw scalar
             // (string or YAML number) and parse it losslessly, so 0.1 + 0.2 stays 0.3.
             return parseBigDecimal(config, path, defaultValue);
+        } else if (type == Component.class) {
+            String raw = config.getString(path, defaultValue);
+            return raw == null ? null : MiniMessage.miniMessage().deserialize(raw);
         } else if (type == List.class) {
             return config.getStringList(path);
         } else if (type.isEnum()) {
             String value = config.getString(path, defaultValue);
-            try {
-                return Enum.valueOf((Class<Enum>) type, value);
-            } catch (IllegalArgumentException e) {
+            // Matched case-insensitively on purpose: YAML reads unquoted TRUE/FALSE/ON/OFF as
+            // booleans, which Bukkit renders back as "true"/"false", so a strict valueOf would
+            // reject `default: TRUE` against a constant named TRUE.
+            Object constant = matchEnum(type, value);
+            if (constant == null) {
                 throw new IllegalArgumentException("Invalid value '" + value + "' for " + path
                         + "; expected one of " + Arrays.toString(type.getEnumConstants()));
             }
+            return constant;
         }
 
         // For complex types, return the object directly
         return config.get(path);
+    }
+
+    /** Case-insensitive enum constant lookup; null when no constant matches. */
+    private static Object matchEnum(Class<?> type, String value) {
+        if (value == null) {
+            return null;
+        }
+        for (Object constant : type.getEnumConstants()) {
+            if (((Enum<?>) constant).name().equalsIgnoreCase(value)) {
+                return constant;
+            }
+        }
+        return null;
     }
 
     /**
@@ -116,7 +333,7 @@ public class ConfigurationProcessor {
      * number coerced via {@code toString()}), falling back to the annotation
      * default. A malformed value names the path so the operator can find it.
      */
-    private BigDecimal parseBigDecimal(FileConfiguration config, String path, String defaultValue) {
+    private BigDecimal parseBigDecimal(ConfigurationSection config, String path, String defaultValue) {
         String raw;
         if (config.contains(path)) {
             Object value = config.get(path);

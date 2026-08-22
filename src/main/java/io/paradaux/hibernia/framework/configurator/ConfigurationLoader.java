@@ -3,9 +3,13 @@ package io.paradaux.hibernia.framework.configurator;
 import com.google.inject.Singleton;
 
 import io.paradaux.hibernia.framework.configurator.annotations.ConfigurationComponent;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.reflections.Reflections;
 
+import java.io.File;
 import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -17,8 +21,15 @@ import java.util.logging.Level;
 /**
  * Discovers {@code @ConfigurationComponent} classes on the classpath,
  * instantiates them and injects their {@code @ConfigurationValue} fields from
- * the plugin's {@code config.yml}. Instances are singletons, intended to be
+ * the plugin's configuration. Instances are singletons, intended to be
  * bound into Guice (which {@code HiberniaModule} does automatically).
+ *
+ * <h2>Multiple files</h2>
+ * <p>A component reads {@code config.yml} unless it names another file via
+ * {@link ConfigurationComponent#file()}. Named files live in the plugin's data folder, are
+ * copied out of the jar on first run if absent, and are re-read by {@link #reload()} along
+ * with {@code config.yml}. This lets a plugin keep several focused operator-facing files
+ * instead of one large one.</p>
  *
  * <h2>Atomic reload</h2>
  * <p>{@link #reload()} does <strong>not</strong> mutate live component instances in
@@ -37,10 +48,15 @@ import java.util.logging.Level;
 @Singleton
 public class ConfigurationLoader {
 
+    /** The component file name that means "the plugin's own config.yml". */
+    public static final String DEFAULT_FILE = "config.yml";
+
     private final JavaPlugin plugin;
     private final ConfigurationProcessor processor;
     /** Component classes that have loaded at least once, in discovery order; rebuilt on reload. */
     private final List<Class<?>> componentClasses = new ArrayList<>();
+    /** Loaded auxiliary files, keyed by file name. {@code config.yml} is not held here. */
+    private final Map<String, FileConfiguration> auxiliaryFiles = new LinkedHashMap<>();
     /** The current immutable snapshot of loaded components; swapped atomically on reload. */
     private volatile Map<Class<?>, Object> components = Map.of();
 
@@ -62,8 +78,7 @@ public class ConfigurationLoader {
         Map<Class<?>, Object> updated = new LinkedHashMap<>(components);
         for (Class<?> componentClass : componentClasses) {
             try {
-                Object instance = instantiate(componentClass);
-                processor.process(instance);
+                Object instance = build(componentClass);
                 updated.put(componentClass, instance);
                 if (!this.componentClasses.contains(componentClass)) {
                     this.componentClasses.add(componentClass);
@@ -99,7 +114,21 @@ public class ConfigurationLoader {
     }
 
     /**
-     * Re-read {@code config.yml} from disk and rebuild every loaded component into a
+     * The parsed contents of an auxiliary configuration file, loading it if this is the first
+     * request. Useful for reading a file that no component maps in full.
+     *
+     * @param fileName a YAML file in the plugin's data folder
+     * @return its configuration, empty if the file is absent from both disk and the jar
+     */
+    public FileConfiguration getFile(String fileName) {
+        if (DEFAULT_FILE.equals(fileName)) {
+            return plugin.getConfig();
+        }
+        return auxiliaryFiles.computeIfAbsent(fileName, this::loadFile);
+    }
+
+    /**
+     * Re-read every configuration file from disk and rebuild each loaded component into a
      * fresh instance, then publish the whole set atomically. Readers going through
      * {@link #getComponent(Class)} switch from the old snapshot to the new one in a
      * single step — they never observe a partially-updated component. A component that
@@ -107,14 +136,15 @@ public class ConfigurationLoader {
      */
     public void reload() {
         plugin.reloadConfig();
+        // Drop the cache so each auxiliary file is re-read on next use; a component whose file
+        // was edited must not keep binding from the copy parsed at startup.
+        auxiliaryFiles.clear();
 
         Map<Class<?>, Object> previous = components;
         Map<Class<?>, Object> rebuilt = new LinkedHashMap<>();
         for (Class<?> componentClass : componentClasses) {
             try {
-                Object instance = instantiate(componentClass);
-                processor.process(instance);
-                rebuilt.put(componentClass, instance);
+                rebuilt.put(componentClass, build(componentClass));
             } catch (Exception e) {
                 Object prev = previous.get(componentClass);
                 if (prev != null) {
@@ -125,6 +155,56 @@ public class ConfigurationLoader {
             }
         }
         this.components = Map.copyOf(rebuilt);
+    }
+
+    /** Instantiate a component and bind it from whichever file and root path it declares. */
+    private Object build(Class<?> componentClass) throws Exception {
+        Object instance = instantiate(componentClass);
+        processor.process(instance, sectionFor(componentClass));
+        return instance;
+    }
+
+    /**
+     * The section a component binds from: its file's root, or the subsection named by
+     * {@link ConfigurationComponent#path()}. A declared-but-absent root path binds against an
+     * empty section so the component still loads on its defaults rather than failing outright.
+     */
+    private ConfigurationSection sectionFor(Class<?> componentClass) {
+        ConfigurationComponent annotation = componentClass.getAnnotation(ConfigurationComponent.class);
+        String fileName = annotation == null ? DEFAULT_FILE : annotation.file();
+        FileConfiguration file = getFile(fileName);
+
+        String root = annotation == null ? "" : annotation.path();
+        if (root == null || root.isEmpty()) {
+            return file;
+        }
+        ConfigurationSection section = file.getConfigurationSection(root);
+        if (section != null) {
+            return section;
+        }
+        plugin.getLogger().warning("Configuration path '" + root + "' not found in " + fileName
+                + " for " + componentClass.getSimpleName() + "; using defaults");
+        return new YamlConfiguration();
+    }
+
+    /**
+     * Loads an auxiliary file, first copying the jar's packaged copy into the data folder when
+     * the operator has none — the same first-run behaviour {@code config.yml} gets.
+     */
+    private FileConfiguration loadFile(String fileName) {
+        File file = new File(plugin.getDataFolder(), fileName);
+        if (!file.exists()) {
+            try {
+                plugin.saveResource(fileName, false);
+            } catch (IllegalArgumentException noSuchResource) {
+                // No packaged default: an empty configuration is the right answer, and the
+                // component falls back to its annotation defaults.
+                plugin.getLogger().warning("No packaged default for configuration file '" + fileName
+                        + "'; components reading it will use their declared defaults");
+                return new YamlConfiguration();
+            }
+        }
+        return YamlConfiguration.loadConfiguration(file);
     }
 
     private Object instantiate(Class<?> componentClass) throws Exception {
