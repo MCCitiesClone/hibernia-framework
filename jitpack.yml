@@ -1,0 +1,13 @@
+# This fork is consumed from source over JitPack (Realty depends on
+# com.github.MCCitiesClone:hibernia-framework). Two things JitPack gets wrong by default:
+#
+#   * it builds with JDK 8, and this project pins a Java 21 toolchain, so toolchain
+#     resolution fails outright before compiling anything;
+#   * its default Gradle invocation runs `check`, which here includes a JaCoCo coverage
+#     gate — a consumer's dependency resolution should not be able to fail on the
+#     framework's own coverage ratio. Tests and the gate run in this repo's CI instead.
+jdk:
+  - openjdk21
+
+install:
+  - ./gradlew publishToMavenLocal -x test -x jacocoTestCoverageVerification -x jacocoTestReport
