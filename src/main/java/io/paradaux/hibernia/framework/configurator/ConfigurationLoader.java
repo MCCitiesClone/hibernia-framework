@@ -64,8 +64,14 @@ public class ConfigurationLoader {
         this.plugin = plugin;
         this.processor = new ConfigurationProcessor(plugin);
 
-        // Ensure config.yml exists
-        plugin.saveDefaultConfig();
+        // Ensure config.yml exists. Bukkit's saveDefaultConfig() throws when the jar packages no
+        // config.yml, which is a legitimate layout now that components can each name their own
+        // file — such a plugin may have no config.yml at all. Absence is not an error here.
+        try {
+            plugin.saveDefaultConfig();
+        } catch (IllegalArgumentException noPackagedConfig) {
+            plugin.getLogger().fine("No packaged config.yml; components must name their own files");
+        }
     }
 
     /**

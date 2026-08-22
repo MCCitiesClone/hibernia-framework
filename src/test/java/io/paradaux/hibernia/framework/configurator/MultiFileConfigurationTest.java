@@ -15,9 +15,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.logging.Logger;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -82,6 +84,19 @@ class MultiFileConfigurationTest {
 
     private void write(String name, String contents) throws IOException {
         Files.writeString(dataFolder.resolve(name), contents, StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void aPluginWithNoPackagedConfigYmlStillConstructs() {
+        // Bukkit throws from saveDefaultConfig() when the jar packages no config.yml. That is a
+        // legitimate layout once components name their own files, so it must not abort startup.
+        JavaPlugin bare = mock(JavaPlugin.class);
+        when(bare.getLogger()).thenReturn(mock(Logger.class));
+        when(bare.getDataFolder()).thenReturn(dataFolder.toFile());
+        doThrow(new IllegalArgumentException("The embedded resource 'config.yml' cannot be found"))
+                .when(bare).saveDefaultConfig();
+
+        assertDoesNotThrow(() -> new ConfigurationLoader(bare));
     }
 
     @Test
