@@ -19,6 +19,9 @@ import org.bukkit.event.Listener;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import java.util.Set;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -93,7 +96,7 @@ public final class HiberniaModule extends AbstractModule {
         // ConfigurationLoader (saveDefaultConfig) and Message (ensureDefaultFile + reload) below
         // read those files — so they load the freshly merged content.
         if (builder.reconcileDefaults) {
-            DefaultsReconciler.reconcile(plugin);
+            DefaultsReconciler.reconcile(plugin, builder.reconcileFiles);
         }
 
         this.configurationLoader = new ConfigurationLoader(plugin);
@@ -175,6 +178,7 @@ public final class HiberniaModule extends AbstractModule {
         private Class<? extends PapiSupport> papiSupport = PlaceholderApiSupport.class;
         private boolean bindMessage = true;
         private boolean reconcileDefaults = true;
+        private final Set<String> reconcileFiles = new LinkedHashSet<>();
 
         private Builder(JavaPlugin plugin) {
             this.plugin = Objects.requireNonNull(plugin, "plugin");
@@ -247,6 +251,19 @@ public final class HiberniaModule extends AbstractModule {
          */
         public Builder withoutMessages() {
             this.bindMessage = false;
+            return this;
+        }
+
+        /**
+         * Additional YAML files in the data folder to include in the on-upgrade defaults
+         * reconciliation, for components that name their own file rather than using
+         * {@code config.yml}. Repeatable.
+         *
+         * @param fileNames file names as they appear in the data folder and the jar
+         * @return this builder
+         */
+        public Builder reconcileFiles(String... fileNames) {
+            this.reconcileFiles.addAll(Arrays.asList(fileNames));
             return this;
         }
 

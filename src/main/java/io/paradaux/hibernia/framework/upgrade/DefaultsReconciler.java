@@ -7,6 +7,8 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.Set;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -42,6 +44,17 @@ public final class DefaultsReconciler {
 
     /** Run the version-gated reconcile for {@code plugin}. Never throws — failures are logged. */
     public static void reconcile(JavaPlugin plugin) {
+        reconcile(plugin, Set.of());
+    }
+
+    /**
+     * Run the version-gated reconcile, additionally covering {@code extraYamlFiles}.
+     *
+     * <p>A plugin whose components each name their own file — {@code settings.yml},
+     * {@code taxes.yml} — needs those reconciled too, or an upgrade that ships new keys would
+     * leave every operator-edited file behind while only {@code config.yml} caught up.</p>
+     */
+    public static void reconcile(JavaPlugin plugin, Collection<String> extraYamlFiles) {
         File dataFolder = plugin.getDataFolder();
         if (dataFolder == null) {
             return;
@@ -55,6 +68,9 @@ public final class DefaultsReconciler {
         try {
             reconcileFile(dataFolder, "messages.properties", resource(plugin, "messages.properties"), Kind.PROPERTIES);
             reconcileFile(dataFolder, "config.yml", resource(plugin, "config.yml"), Kind.YAML);
+            for (String fileName : extraYamlFiles) {
+                reconcileFile(dataFolder, fileName, resource(plugin, fileName), Kind.YAML);
+            }
         } catch (Exception e) {
             log.warn("Defaults reconciliation failed: {}", e.getMessage());
         }
