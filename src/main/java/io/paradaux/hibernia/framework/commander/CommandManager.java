@@ -14,6 +14,7 @@ import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import io.paradaux.hibernia.framework.commander.annotations.*;
 import io.paradaux.hibernia.framework.commander.resolvers.BigDecimalResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.BooleanResolver;
+import io.paradaux.hibernia.framework.commander.resolvers.EnumResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.IntegerResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.LongResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.OfflinePlayerResolver;
@@ -469,7 +470,19 @@ public class CommandManager {
                 bestKey = key;
             }
         }
-        return best != null ? best : NO_RESOLVER;
+        if (best != null) {
+            return best;
+        }
+
+        // No registered resolver, but an enum can always resolve itself by constant name. Doing it
+        // here rather than at each call site means an enum argument needs no boilerplate, and a
+        // plugin that wants different behaviour still wins by registering an exact-type resolver.
+        if (type.isEnum()) {
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            ParameterResolver<?> synthesised = new EnumResolver((Class) type);
+            return synthesised;
+        }
+        return NO_RESOLVER;
     }
 
     /**

@@ -19,6 +19,7 @@ import java.util.logging.Logger;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -91,6 +92,39 @@ class RecordConfigurationTest {
     record GroupRoot(@ConfigurationValue(path = "grouped") List<RegionGroup> grouped) {
     }
 
+    record DefaultPathRecord(
+            // No explicit path: the component name is the key.
+            @ConfigurationValue(path = "") String host,
+            @ConfigurationValue(path = "") int port
+    ) {
+    }
+
+    record ThrowingRecord(@ConfigurationValue(path = "value") String value) {
+        ThrowingRecord {
+            if ("boom".equals(value)) {
+                throw new IllegalArgumentException("value must not be boom");
+            }
+        }
+    }
+
+    record PrimitiveRecord(
+            @ConfigurationValue(path = "flag") boolean flag,
+            @ConfigurationValue(path = "count") long count,
+            @ConfigurationValue(path = "ratio") double ratio,
+            @ConfigurationValue(path = "fraction") float fraction,
+            @ConfigurationValue(path = "small") short small,
+            @ConfigurationValue(path = "tiny") byte tiny,
+            @ConfigurationValue(path = "letter") char letter
+    ) {
+    }
+
+    @ConfigurationObject
+    record Deep(@ConfigurationValue(path = "next") Deep next) {
+    }
+
+    record DeepRoot(@ConfigurationValue(path = "root") Deep root) {
+    }
+
     private ConfigurationProcessor processor;
 
     @BeforeEach
@@ -141,6 +175,54 @@ class RecordConfigurationTest {
         assertNull(settings.authority());
         // 0 reaches the compact constructor, which clamps it — no NPE unboxing null into an int.
         assertEquals(10, settings.reapplyPerTick());
+    }
+
+    @Test
+    void anEmptyPathFallsBackToTheComponentName() {
+        DefaultPathRecord bound = (DefaultPathRecord) processor.create(DefaultPathRecord.class,
+                yaml("host: example.com\nport: 25565\n"));
+
+        assertEquals("example.com", bound.host());
+        assertEquals(25565, bound.port());
+    }
+
+    @Test
+    void aRejectingCompactConstructorSurfacesItsOwnMessage() {
+        // The record's validation is the point of constructing it; when it refuses, the reason has
+        // to reach the operator rather than being swallowed into a generic failure.
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> processor.create(ThrowingRecord.class, yaml("value: boom\n")));
+
+        assertTrue(thrown.getMessage().contains("value must not be boom"), thrown.getMessage());
+    }
+
+    @Test
+    void everyPrimitiveComponentGetsItsZeroValueWhenUnconfigured() {
+        // A canonical constructor cannot take null for a primitive, so each width needs its own
+        // zero; getting one wrong throws IllegalArgumentException deep inside reflection.
+        PrimitiveRecord bound =
+                (PrimitiveRecord) processor.create(PrimitiveRecord.class, yaml("unrelated: 1\n"));
+
+        assertEquals(false, bound.flag());
+        assertEquals(0L, bound.count());
+        assertEquals(0d, bound.ratio());
+        assertEquals(0f, bound.fraction());
+        assertEquals((short) 0, bound.small());
+        assertEquals((byte) 0, bound.tiny());
+        assertEquals((char) 0, bound.letter());
+    }
+
+    @Test
+    void nestingBeyondTheDepthLimitIsReportedRatherThanOverflowing() {
+        StringBuilder deep = new StringBuilder("root:\n");
+        String indent = "  ";
+        for (int i = 0; i < 20; i++) {
+            deep.append(indent.repeat(i + 1)).append("next:\n");
+        }
+        DeepRoot bound = (DeepRoot) processor.create(DeepRoot.class, yaml(deep.toString()));
+
+        // The processor logs and leaves the field unset rather than recursing off the stack.
+        assertNotNull(bound);
     }
 
     @Test

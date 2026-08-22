@@ -1,10 +1,14 @@
 package io.paradaux.hibernia.framework.commander;
 
+import com.mojang.brigadier.builder.ArgumentBuilder;
+import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.tree.CommandNode;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
+import io.papermc.paper.command.brigadier.Commands;
 import io.paradaux.hibernia.framework.commander.annotations.Arg;
 import io.paradaux.hibernia.framework.commander.annotations.Command;
 import io.paradaux.hibernia.framework.commander.annotations.Flag;
@@ -88,6 +92,10 @@ class CommandFlagTest {
 
         @Route("raw")
         public void raw(@Flag(value = "url", sanitize = false) String url) {
+        }
+
+        @Route("plain")
+        public void plain(@Sender CommandSender sender) {
         }
     }
 
@@ -327,6 +335,44 @@ class CommandFlagTest {
         when(context.getArgument("region", Object.class)).thenThrow(new IllegalArgumentException("missing"));
 
         assertThrows(FlagTail.FlagSyntaxException.class, () -> extract(binding, context));
+    }
+
+    // ── tree wiring ───────────────────────────────────────────────────────────────
+
+    @Test
+    void theFlagTailIsAttachedToEveryExecutablePathOfTheRoute() throws Exception {
+        // /flags list --page 2 and /flags list spawn --page 2 must both parse, so the tail hangs
+        // off the literal as well as off the optional argument node.
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("flags");
+        invokePrivate("addSegments",
+                new Class[]{ArgumentBuilder.class, listBinding().getClass(), int.class, String.class},
+                root, listBinding(), 0, null);
+
+        CommandNode<CommandSourceStack> list = root.build().getChild("list");
+        assertNotNull(list, "the route literal was not built");
+        assertNotNull(list.getChild(CommandTreeBuilder.FLAG_TAIL_ARG),
+                "no flag tail on the truncated path");
+
+        CommandNode<CommandSourceStack> region = list.getChild("region");
+        assertNotNull(region, "the optional argument node was not built");
+        assertNotNull(region.getChild(CommandTreeBuilder.FLAG_TAIL_ARG),
+                "no flag tail after the optional argument");
+    }
+
+    @Test
+    void aRouteWithoutFlagsGetsNoTail() throws Exception {
+        Method method = FlagHandler.class.getDeclaredMethod("plain", CommandSender.class);
+        Object binding = bind(handler, method, "plain");
+
+        LiteralArgumentBuilder<CommandSourceStack> root = Commands.literal("flags");
+        invokePrivate("addSegments",
+                new Class[]{ArgumentBuilder.class, binding.getClass(), int.class, String.class},
+                root, binding, 0, null);
+
+        CommandNode<CommandSourceStack> plain = root.build().getChild("plain");
+        assertNotNull(plain);
+        assertNull(plain.getChild(CommandTreeBuilder.FLAG_TAIL_ARG),
+                "an unflagged route must not grow a flag tail");
     }
 
     // ── completion ────────────────────────────────────────────────────────────────
