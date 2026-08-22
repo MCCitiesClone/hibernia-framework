@@ -2,13 +2,8 @@ package io.paradaux.hibernia.framework.commander;
 
 import com.google.inject.Inject;
 import com.google.inject.Injector;
-import com.google.inject.Key;
 import com.google.inject.Singleton;
-import com.mojang.brigadier.arguments.IntegerArgumentType;
-import com.mojang.brigadier.arguments.LongArgumentType;
-import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.ArgumentBuilder;
-import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
@@ -17,7 +12,6 @@ import io.papermc.paper.command.brigadier.Commands;
 import io.papermc.paper.plugin.lifecycle.event.LifecycleEventManager;
 import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import io.paradaux.hibernia.framework.commander.annotations.*;
-import io.paradaux.hibernia.framework.commander.arguments.BigDecimalArgumentType;
 import io.paradaux.hibernia.framework.commander.resolvers.BigDecimalResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.BooleanResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.IntegerResolver;
@@ -26,23 +20,19 @@ import io.paradaux.hibernia.framework.commander.resolvers.OfflinePlayerResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.StringResolver;
 import io.paradaux.hibernia.framework.commander.spi.CommandHandler;
 import io.paradaux.hibernia.framework.commander.spi.ParameterResolver;
-import io.paradaux.hibernia.framework.exceptions.BadCommandException;
 import io.paradaux.hibernia.framework.exceptions.ConflictException;
-import io.paradaux.hibernia.framework.exceptions.ExceedsLimitException;
 import io.paradaux.hibernia.framework.exceptions.NoPermissionException;
 import io.paradaux.hibernia.framework.exceptions.NotFoundException;
-import io.paradaux.hibernia.framework.i18n.Message;
+import io.paradaux.hibernia.framework.exceptions.BadCommandException;
+import io.paradaux.hibernia.framework.exceptions.ExceedsLimitException;
 import lombok.extern.slf4j.Slf4j;
 import net.kyori.adventure.text.Component;
-import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.command.CommandSender;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.lang.reflect.Parameter;
-import java.math.BigDecimal;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
@@ -50,13 +40,11 @@ import java.util.logging.Level;
 /**
  * Central manager for registering and dispatching plugin commands.
  *
- * <p>Responsibilities:
- * - Scans provided CommandHandler instances for @Command and @Route annotations,
- *   and builds a Brigadier command tree for Paper.
- * - Binds method parameters annotated with @Arg, @OptionalArg, @GreedyArg and @Sender to
- *   command arguments and injects them at invocation time.
- * - Respects @Permission on classes or methods to gate execution.
- * - Supports asynchronous execution for methods annotated with @Async.</p>
+ * <p>Responsibilities are split across small collaborators: {@link RouteBinder}
+ * parses and validates routes, {@link CommandTreeBuilder} builds the Brigadier tree
+ * and enforces conflict guarantees, and {@link ErrorRenderer} maps exceptions to user
+ * feedback. This class orchestrates them — scanning handlers, wiring the lifecycle
+ * event, resolving arguments at dispatch time and exposing the route index.</p>
  *
  * <p>Route syntax:
  * literals are plain tokens, required arguments are {@code <name>}, optional
@@ -81,27 +69,13 @@ import java.util.logging.Level;
  * <p>Error handling:
  * the framework's HTTP-semantic exceptions ({@link NotFoundException},
  * {@link ConflictException}, {@link BadCommandException}, {@link ExceedsLimitException},
- * {@link NoPermissionException}) thrown from a handler (typically propagated from the
- * service layer) are caught and rendered to the sender. Each maps to a
- * {@code hibernia.error.*} key in the consumer's {@code messages.properties} when a
- * {@link Message} bean is bound, falling back to built-in MiniMessage defaults
- * otherwise. Unknown exceptions render a generic internal-error message and are
- * logged with their stack trace.</p>
+ * {@link NoPermissionException}) thrown from a handler are caught and rendered via
+ * {@link ErrorRenderer}; each maps to a {@code hibernia.error.*} key in the consumer's
+ * {@code messages.properties} when a {@code Message} bean is bound.</p>
  *
  * <p>Threading:
  * Commands annotated with {@link Async} are dispatched asynchronously; sender messages and
  * other Bukkit main-thread operations are scheduled back onto the main thread where necessary.</p>
- *
- * <p>Example usage:
- * <pre>
- * // A handler class
- * @Command("example")
- * public class Example implements CommandHandler {
- *     @Route("give &lt;player&gt; &lt;amount&gt;")
- *     public void give(@Sender Player sender, @Arg("player") OfflinePlayer target, @Arg("amount") int amount) { ... }
- * }
- * </pre>
- * </p>
  */
 @Singleton
 @Slf4j
@@ -116,24 +90,27 @@ public class CommandManager {
     public static final String KEY_EXCEEDS_LIMIT    = "hibernia.error.exceeds-limit";
     public static final String KEY_INTERNAL         = "hibernia.error.internal";
 
-    private static final String DEFAULT_NO_PERMISSION = "<red>You don't have permission to do that.</red>";
-    private static final String DEFAULT_WITH_MESSAGE  = "<red>{message}</red>";
-    private static final String DEFAULT_INTERNAL      = "<red>An internal error occurred. Please contact an administrator.</red>";
-
-    private static final MiniMessage MINI = MiniMessage.miniMessage();
+    /** Sentinel cached for parameter types that have no assignable resolver (so misses aren't re-walked). */
+    private static final ParameterResolver<?> NO_RESOLVER = new ParameterResolver<>() {
+        public Class<Object> type() { return Object.class; }
+        public Optional<Object> resolve(String token, CommandSender sender) { return Optional.empty(); }
+    };
 
     private final JavaPlugin plugin;
     private final Set<CommandHandler> handlers;
     private final Map<Class<?>, ParameterResolver<?>> resolvers = new ConcurrentHashMap<>();
-    private final Injector injector;
+    /** Memoised resolution of a parameter type to its servicing resolver (incl. supertype/wrapper matches). */
+    private final Map<Class<?>, ParameterResolver<?>> resolverCache = new ConcurrentHashMap<>();
 
-    private volatile Message message;
-    private volatile boolean messageResolved;
+    private final RouteBinder routeBinder = new RouteBinder();
+    private final CommandTreeBuilder treeBuilder;
+    private final ErrorRenderer errorRenderer;
+
     private volatile List<RouteInfo> routeIndex = List.of();
 
     /**
      * Create a CommandManager without an injector. Error messages always use the
-     * built-in MiniMessage defaults rather than a consumer-bound {@link Message}.
+     * built-in MiniMessage defaults rather than a consumer-bound {@code Message}.
      *
      * @param plugin the JavaPlugin instance used for scheduling and lifecycle
      * @param handlers the set of discovered CommandHandler instances to register
@@ -150,14 +127,13 @@ public class CommandManager {
      * @param handlers the set of discovered CommandHandler instances to register
      * @param resolverSet additional ParameterResolver implementations to register
      * @param injector the Guice injector, used to discover an explicitly bound
-     *                 {@link Message} bean for rendering error feedback (optional)
+     *                 {@code Message} bean for rendering error feedback (optional)
      */
     @Inject
     public CommandManager(JavaPlugin plugin, Set<CommandHandler> handlers,
                           Set<ParameterResolver<?>> resolverSet, Injector injector) {
         this.plugin = plugin;
         this.handlers = handlers;
-        this.injector = injector;
         resolverSet.forEach(r -> resolvers.put(r.type(), r));
         // Built-ins
         registerResolver(new StringResolver());
@@ -166,6 +142,9 @@ public class CommandManager {
         registerResolver(new BigDecimalResolver());
         registerResolver(new BooleanResolver());
         registerResolver(new OfflinePlayerResolver());
+
+        this.treeBuilder = new CommandTreeBuilder(plugin, this::resolverFor, this::executeBinding);
+        this.errorRenderer = new ErrorRenderer(plugin, injector);
     }
 
     /**
@@ -253,7 +232,7 @@ public class CommandManager {
         List<RouteBinding> bindings = new ArrayList<>();
         for (Method method : routeMethods) {
             for (Route route : method.getAnnotationsByType(Route.class)) {
-                bindings.add(bindRoute(handler, method, route, classPerm));
+                bindings.add(routeBinder.bind(handler, method, route, classPerm));
             }
         }
 
@@ -275,183 +254,29 @@ public class CommandManager {
             Map<String, String> staged = new LinkedHashMap<>();
             Map<String, ArgKind> stagedKinds = new LinkedHashMap<>();
             for (RouteBinding b : bindings) {
-                checkConflicts(spec, staged, stagedKinds, b, rootLabel);
+                treeBuilder.checkConflicts(spec, staged, stagedKinds, b, rootLabel);
             }
             spec.routesSeen.putAll(staged);
             spec.argKinds.putAll(stagedKinds);
 
             // Phase 3 — mutate the tree. Nothing below should throw.
             for (RouteBinding b : bindings) {
-                warnOnAmbiguousSiblings(spec, b, rootLabel);
+                treeBuilder.warnOnAmbiguousSiblings(spec, b, rootLabel);
                 if (b.path.isEmpty()) {
                     spec.builder.executes(ctx -> executeBinding(ctx, b));
                 } else {
-                    addSegments(spec.builder, b, 0, classPerm);
+                    treeBuilder.addSegments(spec.builder, b, 0, classPerm);
                 }
                 index.add(new RouteInfo(rootLabel, b.rawPattern, b.description, b.permission, b.async));
             }
         }
     }
 
-    /**
-     * Every path at which a binding is executable: its full path, plus each
-     * truncation produced by omitting trailing optional segments.
-     */
-    private List<String> executablePathKeys(RouteBinding binding) {
-        List<String> keys = new ArrayList<>();
-        keys.add(pathKey(binding.path, binding.path.size()));
-        for (int end = binding.path.size() - 1; end >= 0 && binding.path.get(end).optionalArg(); end--) {
-            keys.add(pathKey(binding.path, end));
-        }
-        return keys;
-    }
-
-    private static String pathKey(List<Segment> path, int end) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < end; i++) {
-            Segment s = path.get(i);
-            if (i > 0) sb.append(' ');
-            sb.append(s.literal() ? "lit:" + s.token() : "arg:" + s.token());
-        }
-        return sb.toString();
-    }
-
-    private void checkConflicts(RootSpec spec, Map<String, String> staged, Map<String, ArgKind> stagedKinds,
-                                RouteBinding binding, String rootLabel) {
-        String where = describe(binding);
-        for (String key : executablePathKeys(binding)) {
-            String existing = spec.routesSeen.getOrDefault(key, staged.get(key));
-            if (existing != null) {
-                throw new IllegalStateException("Route conflict under /" + rootLabel + ": " + where
-                        + " and " + existing + " both execute at '" + (key.isEmpty() ? "(root)" : key) + "'");
-            }
-            staged.put(key, where);
-        }
-        // Same-named argument nodes merge in Brigadier; if their argument types
-        // differ, the first type silently wins at parse time and the other
-        // binding receives garbage. Refuse to register that.
-        for (int i = 0; i < binding.path.size(); i++) {
-            Segment seg = binding.path.get(i);
-            if (seg.literal()) continue;
-            Param param = findParamByName(binding.params, seg.token());
-            ArgKind kind = argKindOf(param);
-            String nodeKey = pathKey(binding.path, i) + " arg:" + seg.token();
-            ArgKind existing = spec.argKinds.getOrDefault(nodeKey, stagedKinds.get(nodeKey));
-            if (existing != null && existing != kind) {
-                throw new IllegalStateException("Argument type conflict under /" + rootLabel + ": <" + seg.token()
-                        + "> at '" + pathKey(binding.path, i) + "' is declared both as " + existing + " and as "
-                        + kind + " (" + where + ")");
-            }
-            stagedKinds.put(nodeKey, kind);
-        }
-    }
-
-    private void warnOnAmbiguousSiblings(RootSpec spec, RouteBinding binding, String rootLabel) {
-        for (int i = 0; i < binding.path.size(); i++) {
-            Segment seg = binding.path.get(i);
-            if (seg.literal()) continue;
-            String parentKey = pathKey(binding.path, i);
-            String existing = spec.argChildAt.putIfAbsent(parentKey, seg.token());
-            if (existing != null && !existing.equals(seg.token())) {
-                plugin.getLogger().warning("Ambiguous routes under /" + rootLabel + ": arguments <" + existing
-                        + "> and <" + seg.token() + "> are siblings at '"
-                        + (parentKey.isEmpty() ? "(root)" : parentKey)
-                        + "'. Brigadier will parse input with whichever registered first.");
-            }
-        }
-    }
-
-    private static String describe(RouteBinding binding) {
-        return binding.method.getDeclaringClass().getSimpleName() + "#" + binding.method.getName()
-                + " (route '" + binding.rawPattern + "')";
-    }
-
-    private void addSegments(ArgumentBuilder<CommandSourceStack, ?> parent,
-                             RouteBinding binding, int depth, String classPerm) {
-        if (depth >= binding.path.size()) {
-            parent.executes(ctx -> executeBinding(ctx, binding));
-            return;
-        }
-
-        Segment segment = binding.path.get(depth);
-
-        // An optional tail means the command is also executable without it;
-        // conflict checks have already guaranteed this executes slot is ours.
-        if (segment.optionalArg() && parent.getCommand() == null) {
-            parent.executes(ctx -> executeBinding(ctx, binding));
-        }
-
-        ArgumentBuilder<CommandSourceStack, ?> child;
-        if (segment.literal()) {
-            child = Commands.literal(segment.token());
-        } else {
-            // Validated non-null at bind time.
-            Param param = findParamByName(binding.params, segment.token());
-            RequiredArgumentBuilder<CommandSourceStack, ?> argBuilder =
-                    createArgumentBuilder(segment.token(), param);
-            argBuilder.suggests(createArgumentSuggestionProvider(param));
-            child = argBuilder;
-        }
-
-        if (depth == 0 && classPerm != null) {
-            child.requires(src -> src.getSender().hasPermission(classPerm));
-        }
-        if (depth == binding.path.size() - 1) {
-            child.executes(ctx -> executeBinding(ctx, binding));
-        } else {
-            addSegments(child, binding, depth + 1, classPerm);
-        }
-        parent.then(child);
-    }
-
-    private RequiredArgumentBuilder<CommandSourceStack, ?> createArgumentBuilder(String name, Param param) {
-        if (param.type == Integer.class || param.type == int.class) {
-            return Commands.argument(name, IntegerArgumentType.integer());
-        } else if (param.type == Long.class || param.type == long.class) {
-            return Commands.argument(name, LongArgumentType.longArg());
-        } else if (param.greedy) {
-            return Commands.argument(name, StringArgumentType.greedyString());
-        } else if (param.type == BigDecimal.class) {
-            return Commands.argument(name, BigDecimalArgumentType.bigDecimal());
-        } else {
-            return Commands.argument(name, StringArgumentType.word());
-        }
-    }
-
-    private static ArgKind argKindOf(Param param) {
-        if (param.type == Integer.class || param.type == int.class) return ArgKind.INTEGER;
-        if (param.type == Long.class || param.type == long.class) return ArgKind.LONG;
-        if (param.greedy) return ArgKind.GREEDY;
-        if (param.type == BigDecimal.class) return ArgKind.BIG_DECIMAL;
-        return ArgKind.WORD;
-    }
-
-    private SuggestionProvider<CommandSourceStack> createArgumentSuggestionProvider(Param param) {
-        return (context, builder) -> {
-            CommandSender sender = context.getSource().getSender();
-            String input = builder.getRemaining();
-
-            @SuppressWarnings("unchecked")
-            ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolvers.get(param.type);
-
-            List<String> suggestions = (resolver != null)
-                    ? resolver.suggestions(input, sender)
-                    : List.of();
-
-            if (suggestions.isEmpty()) {
-                builder.suggest(param.optional ? "[" + param.name + "]" : "<" + param.name + ">");
-            } else {
-                for (String s : suggestions) builder.suggest(s);
-            }
-            return builder.buildFuture();
-        };
-    }
-
     private int executeBinding(CommandContext<CommandSourceStack> context, RouteBinding binding) {
         CommandSender sender = context.getSource().getSender();
 
         if (binding.permission != null && !sender.hasPermission(binding.permission)) {
-            sendError(sender, KEY_NO_PERMISSION, DEFAULT_NO_PERMISSION, Map.of());
+            errorRenderer.noPermission(sender);
             return 0;
         }
 
@@ -460,14 +285,13 @@ public class CommandManager {
                 Object[] invokeArgs = extractArguments(context, binding, sender);
                 binding.method.invoke(binding.instance, invokeArgs);
             } catch (IllegalArgumentException iae) {
-                sendError(sender, KEY_INVALID_ARGUMENT, DEFAULT_WITH_MESSAGE,
-                        Map.of("message", messageOf(iae, "Invalid arguments.")));
+                errorRenderer.invalidArgument(sender, iae);
             } catch (InvocationTargetException ite) {
-                handleInvocationFailure(sender, binding, ite.getTargetException());
+                errorRenderer.handleInvocationFailure(sender, ite.getTargetException(), binding.describe());
             } catch (Exception e) {
-                sendError(sender, KEY_INTERNAL, DEFAULT_INTERNAL, Map.of());
+                errorRenderer.internalError(sender);
                 plugin.getLogger().log(Level.SEVERE,
-                        "Command dispatch failed for " + describe(binding), e);
+                        "Command dispatch failed for " + binding.describe(), e);
             }
         };
 
@@ -480,84 +304,15 @@ public class CommandManager {
         return 1;
     }
 
-    /**
-     * Map the framework's HTTP-semantic exceptions, thrown by the handler or
-     * propagated up from the service layer, to user feedback. Anything not in
-     * the taxonomy is a bug: the sender gets a generic message and the full
-     * stack trace goes to the server log.
-     */
-    private void handleInvocationFailure(CommandSender sender, RouteBinding binding, Throwable t) {
-        if (t instanceof NoPermissionException) {
-            sendError(sender, KEY_NO_PERMISSION, DEFAULT_NO_PERMISSION, Map.of());
-        } else if (t instanceof BadCommandException) {
-            sendError(sender, KEY_BAD_COMMAND, DEFAULT_WITH_MESSAGE,
-                    Map.of("message", messageOf(t, "Invalid command.")));
-        } else if (t instanceof NotFoundException) {
-            sendError(sender, KEY_NOT_FOUND, DEFAULT_WITH_MESSAGE,
-                    Map.of("message", messageOf(t, "Not found.")));
-        } else if (t instanceof ConflictException) {
-            sendError(sender, KEY_CONFLICT, DEFAULT_WITH_MESSAGE,
-                    Map.of("message", messageOf(t, "That conflicts with something that already exists.")));
-        } else if (t instanceof ExceedsLimitException) {
-            sendError(sender, KEY_EXCEEDS_LIMIT, DEFAULT_WITH_MESSAGE,
-                    Map.of("message", messageOf(t, "That exceeds a limit.")));
-        } else {
-            sendError(sender, KEY_INTERNAL, DEFAULT_INTERNAL, Map.of());
-            plugin.getLogger().log(Level.SEVERE, "Unhandled exception in " + describe(binding), t);
-        }
-    }
-
-    private static String messageOf(Throwable t, String fallback) {
-        String m = t.getMessage();
-        return (m == null || m.isBlank()) ? fallback : m;
-    }
-
-    /**
-     * Render an error through the consumer's {@link Message} bean when one is
-     * bound (so operators can re-word/translate via {@code hibernia.error.*}
-     * keys), otherwise through the built-in MiniMessage default pattern.
-     */
-    private void sendError(CommandSender sender, String key, String fallbackPattern, Map<String, ?> values) {
-        Message msg = resolveMessage();
-        Component component;
-        if (msg != null) {
-            component = msg.componentOr(sender, key, fallbackPattern, values);   // sender's locale
-        } else {
-            String pattern = fallbackPattern;
-            for (Map.Entry<String, ?> e : values.entrySet()) {
-                pattern = pattern.replace("{" + e.getKey() + "}",
-                        MINI.escapeTags(Objects.toString(e.getValue())));
-            }
-            component = MINI.deserialize(pattern);
-        }
-        safeMsg(sender, component);
-    }
-
-    /**
-     * Look up an explicitly bound {@link Message} bean. Uses
-     * {@code getExistingBinding} so plugins that never bound Message don't get
-     * one created just-in-time (its constructor expects a bundled
-     * messages.properties resource).
-     */
-    private Message resolveMessage() {
-        if (!messageResolved) {
-            messageResolved = true;
-            if (injector != null) {
-                var binding = injector.getExistingBinding(Key.get(Message.class));
-                if (binding != null) {
-                    message = binding.getProvider().get();
-                }
-            }
-        }
-        return message;
-    }
-
     private Object[] extractArguments(CommandContext<CommandSourceStack> context, RouteBinding binding, CommandSender sender) throws Exception {
         List<Object> values = new ArrayList<>();
+        Map<String, String> flagValues = parseFlagTail(context, binding);
 
         for (Param param : binding.params) {
             if (param.sender) {
                 values.add(injectSender(param.type, sender));
+            } else if (param.flag) {
+                values.add(resolveFlag(binding, param, flagValues, sender));
             } else {
                 String argName = null;
                 for (Segment seg : binding.path) {
@@ -579,21 +334,12 @@ public class CommandManager {
                             }
                             values.add(stringValue);
                         } else {
+                            // resolverFor() handles exact, primitive↔wrapper and
+                            // supertype/interface matches — so handlers can declare
+                            // `boolean flag` as naturally as `Boolean flag`, and a
+                            // resolver bound for a supertype services its subtypes.
                             @SuppressWarnings("unchecked")
-                            ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolvers.get(param.type);
-                            // Primitive params don't match wrapper-keyed resolvers
-                            // out of the box; transparently fall back to the
-                            // wrapper resolver so handlers can declare
-                            // `boolean flag` (etc.) as naturally as `Boolean flag`.
-                            if (resolver == null) {
-                                Class<?> wrapper = primitiveWrapper(param.type);
-                                if (wrapper != null) {
-                                    @SuppressWarnings("unchecked")
-                                    ParameterResolver<Object> wrappedResolver =
-                                            (ParameterResolver<Object>) resolvers.get(wrapper);
-                                    resolver = wrappedResolver;
-                                }
-                            }
+                            ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolverFor(param.type);
 
                             if (resolver != null) {
                                 String stringValue = rawValue.toString();
@@ -626,17 +372,104 @@ public class CommandManager {
         return values.toArray();
     }
 
-    private Param findParamByName(List<Param> params, String name) {
-        for (Param p : params) {
-            if (!p.sender && p.name.equals(name)) {
-                return p;
+    /**
+     * Reads the greedy flag tail off the context and parses it. The node is optional, so an
+     * absent tail is the ordinary "no flags given" case and yields an empty map.
+     */
+    private Map<String, String> parseFlagTail(CommandContext<CommandSourceStack> context, RouteBinding binding) {
+        if (binding.flags.isEmpty()) {
+            return Map.of();
+        }
+        String raw;
+        try {
+            raw = context.getArgument(CommandTreeBuilder.FLAG_TAIL_ARG, String.class);
+        } catch (IllegalArgumentException absent) {
+            return Map.of();
+        }
+        return FlagTail.parse(raw, binding.flags);
+    }
+
+    /**
+     * Binds one {@code @Flag} parameter from the parsed tail, falling back to its declared
+     * default when the flag was not supplied. Presence flags answer the question "was it
+     * given?"; value flags resolve through the same resolver registry as positional arguments,
+     * so a flag and an {@code <arg>} of the same type accept exactly the same input.
+     */
+    private Object resolveFlag(RouteBinding binding, Param param, Map<String, String> flagValues,
+                               CommandSender sender) throws Exception {
+        FlagSpec found = null;
+        for (FlagSpec candidate : binding.flags) {
+            if (candidate.name.equals(param.name)) {
+                found = candidate;
+                break;
             }
         }
-        return null;
+        if (found == null) {
+            throw new IllegalStateException("No flag bound for parameter '" + param.name + "'");
+        }
+        final FlagSpec spec = found;
+
+        boolean supplied = flagValues.containsKey(spec.name);
+        if (spec.presence) {
+            return supplied;
+        }
+        if (!supplied) {
+            return resolveDefault(param, sender);
+        }
+
+        String raw = flagValues.get(spec.name);
+        if (!spec.sanitize && spec.type == String.class) {
+            return raw;
+        }
+
+        @SuppressWarnings("unchecked")
+        ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolverFor(spec.type);
+        if (resolver != null) {
+            return resolver.resolve(raw, sender)
+                    .orElseThrow(() -> new IllegalArgumentException("Invalid --" + spec.name + ": " + raw));
+        }
+        return raw;
     }
 
     private void registerResolver(ParameterResolver<?> r) {
         resolvers.putIfAbsent(r.type(), r);
+    }
+
+    /**
+     * Find the resolver servicing {@code type}, or {@code null} when none is
+     * registered. Resolution order: exact class, then primitive↔wrapper, then the
+     * nearest registered supertype/interface (so a resolver bound for an interface
+     * {@code Account} also services a {@code PersonalAccount} parameter). The
+     * result — including a miss — is memoised, since the registry is fixed after
+     * construction.
+     */
+    private ParameterResolver<?> resolverFor(Class<?> type) {
+        ParameterResolver<?> cached = resolverCache.computeIfAbsent(type, this::computeResolver);
+        return cached == NO_RESOLVER ? null : cached;
+    }
+
+    private ParameterResolver<?> computeResolver(Class<?> type) {
+        ParameterResolver<?> direct = resolvers.get(type);
+        if (direct != null) return direct;
+
+        Class<?> wrapper = primitiveWrapper(type);
+        if (wrapper != null) {
+            ParameterResolver<?> wrapped = resolvers.get(wrapper);
+            if (wrapped != null) return wrapped;
+        }
+
+        // Nearest assignable supertype/interface: among resolvers whose key is a
+        // supertype of `type`, prefer the most specific (lowest in the hierarchy).
+        ParameterResolver<?> best = null;
+        Class<?> bestKey = null;
+        for (Map.Entry<Class<?>, ParameterResolver<?>> entry : resolvers.entrySet()) {
+            Class<?> key = entry.getKey();
+            if (key.isAssignableFrom(type) && (bestKey == null || bestKey.isAssignableFrom(key))) {
+                best = entry.getValue();
+                bestKey = key;
+            }
+        }
+        return best != null ? best : NO_RESOLVER;
     }
 
     /**
@@ -669,13 +502,7 @@ public class CommandManager {
             return defaultValue;
         }
 
-        ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolvers.get(type);
-        if (resolver == null) {
-            Class<?> wrapper = primitiveWrapper(type);
-            if (wrapper != null) {
-                resolver = (ParameterResolver<Object>) resolvers.get(wrapper);
-            }
-        }
+        ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolverFor(type);
         if (resolver != null) {
             return resolver.resolve(defaultValue, sender).orElseThrow(() ->
                     new IllegalArgumentException("Invalid default for " + param.name + ": " + defaultValue));
@@ -706,192 +533,41 @@ public class CommandManager {
         return null;
     }
 
-    private void safeMsg(CommandSender sender, Component msg) {
-        if (plugin.getServer().isPrimaryThread()) {
-            sender.sendMessage(msg);
-        } else {
-            plugin.getServer().getScheduler().runTask(plugin, () -> sender.sendMessage(msg));
-        }
-    }
-
     private Object injectSender(Class<?> type, CommandSender sender) {
         if (type.isInstance(sender)) return type.cast(sender);
         throw new IllegalArgumentException("Sender must be " + type.getSimpleName());
     }
 
+    // ── thin delegators retained for the reflection-based commander test suite ──────
+    // The real logic lives in RouteBinder / CommandTreeBuilder / ErrorRenderer; these
+    // keep the historical private surface so the per-phase tests still exercise it.
+
     private RouteBinding bindRoute(Object instance, Method m, Route r, String classPerm) {
-        String raw = r.value().trim();
-        List<String> parts = raw.isEmpty() ? List.of() : List.of(raw.split("\\s+"));
-
-        List<Segment> segments = new ArrayList<>();
-        for (String p : parts) {
-            if (p.startsWith("<") && p.endsWith(">")) {
-                segments.add(Segment.arg(p.substring(1, p.length() - 1)));
-            } else if (p.startsWith("[") && p.endsWith("]")) {
-                segments.add(Segment.optionalArg(p.substring(1, p.length() - 1)));
-            } else {
-                segments.add(Segment.literal(p));
-            }
-        }
-
-        List<Param> params = new ArrayList<>();
-        boolean foundGreedy = false;
-        for (Parameter rp : m.getParameters()) {
-            boolean isSender = rp.isAnnotationPresent(Sender.class);
-            Arg arg = rp.getAnnotation(Arg.class);
-            OptionalArg opt = rp.getAnnotation(OptionalArg.class);
-            GreedyArg greedy = rp.getAnnotation(GreedyArg.class);
-
-            if (foundGreedy && !isSender) {
-                throw new IllegalStateException("@GreedyArg must be the last argument in the route on " + m);
-            }
-
-            if (isSender) params.add(Param.sender(rp.getType()));
-            else if (greedy != null) {
-                foundGreedy = true;
-                params.add(Param.greedy(rp.getType(), greedy.value(), greedy.sanitize()));
-            }
-            else if (arg != null) params.add(Param.required(rp.getType(), arg.value(), arg.sanitize()));
-            else if (opt != null) {
-                if (rp.getType().isPrimitive() && opt.defaultValue().isEmpty()) {
-                    throw new IllegalStateException("@OptionalArg(\"" + opt.value() + "\") on " + m
-                            + " has a primitive type but no defaultValue; an omitted argument would be null."
-                            + " Provide a defaultValue or use the boxed type.");
-                }
-                params.add(Param.optional(rp.getType(), opt.value(), opt.defaultValue(), opt.sanitize()));
-            }
-            else throw new IllegalStateException("Parameter missing @Sender/@Arg/@OptionalArg/@GreedyArg on " + m);
-        }
-
-        validateRoute(m, raw, segments, params);
-
-        String methodPerm = Optional.ofNullable(m.getAnnotation(Permission.class)).map(Permission::value).orElse(null);
-        String effectivePerm = methodPerm != null ? methodPerm : classPerm;
-
-        String description = Optional.ofNullable(m.getAnnotation(Description.class)).map(Description::value).orElse("");
-
-        return new RouteBinding(instance, m, segments, params, effectivePerm, description, raw);
+        return routeBinder.bind(instance, m, r, classPerm);
     }
 
-    /**
-     * Registration-time validation: every placeholder must have a matching
-     * parameter, every required parameter must appear in the route, optional
-     * segments must form the tail, and greedy arguments must be terminal.
-     * Failing loud here is the point — a mismatch that slipped through used to
-     * silently drop the rest of the route from the command tree.
-     */
-    private void validateRoute(Method m, String raw, List<Segment> segments, List<Param> params) {
-        String where = m.getDeclaringClass().getSimpleName() + "#" + m.getName();
-        Set<String> seenNames = new HashSet<>();
-        boolean optionalTail = false;
-
-        for (int i = 0; i < segments.size(); i++) {
-            Segment seg = segments.get(i);
-            if (seg.literal()) {
-                if (optionalTail) {
-                    throw new IllegalStateException("Route '" + raw + "' on " + where
-                            + ": literal '" + seg.token() + "' cannot follow an optional [segment]");
-                }
-                continue;
-            }
-            if (!seenNames.add(seg.token())) {
-                throw new IllegalStateException("Route '" + raw + "' on " + where
-                        + " uses argument name '" + seg.token() + "' more than once");
-            }
-            Param param = findParamByName(params, seg.token());
-            if (param == null) {
-                throw new IllegalStateException("Route '" + raw + "' on " + where
-                        + " references argument '" + seg.token() + "' but the method has no"
-                        + " @Arg/@OptionalArg/@GreedyArg parameter with that name");
-            }
-            if (seg.optionalArg()) {
-                if (!param.optional) {
-                    throw new IllegalStateException("Route '" + raw + "' on " + where
-                            + ": [" + seg.token() + "] requires an @OptionalArg parameter (found a required one)");
-                }
-                optionalTail = true;
-            } else if (optionalTail) {
-                throw new IllegalStateException("Route '" + raw + "' on " + where
-                        + ": required <" + seg.token() + "> cannot follow an optional [segment]");
-            }
-            if (param.greedy && i != segments.size() - 1) {
-                throw new IllegalStateException("Route '" + raw + "' on " + where
-                        + ": greedy argument <" + seg.token() + "> must be the last segment");
-            }
-        }
-
-        for (Param param : params) {
-            if (param.sender || param.optional) continue;
-            boolean inRoute = segments.stream().anyMatch(s -> !s.literal() && s.token().equals(param.name));
-            if (!inRoute) {
-                throw new IllegalStateException("@Arg(\"" + param.name + "\") on " + where
-                        + " does not appear in route '" + raw + "'; add <" + param.name
-                        + "> to the route or make the parameter @OptionalArg");
-            }
-        }
+    private Param findParamByName(List<Param> params, String name) {
+        return RouteBinder.findParamByName(params, name);
     }
 
-    private enum ArgKind { INTEGER, LONG, GREEDY, BIG_DECIMAL, WORD }
-
-    private enum SegKind { LITERAL, ARG, OPTIONAL_ARG }
-
-    private record Segment(SegKind kind, String token) {
-        static Segment literal(String s) {
-            return new Segment(SegKind.LITERAL, s.toLowerCase(Locale.ROOT));
-        }
-        static Segment arg(String name) {
-            return new Segment(SegKind.ARG, name);
-        }
-        static Segment optionalArg(String name) {
-            return new Segment(SegKind.OPTIONAL_ARG, name);
-        }
-        boolean literal() { return kind == SegKind.LITERAL; }
-        boolean optionalArg() { return kind == SegKind.OPTIONAL_ARG; }
+    private void addSegments(ArgumentBuilder<CommandSourceStack, ?> parent,
+                             RouteBinding binding, int depth, String classPerm) {
+        treeBuilder.addSegments(parent, binding, depth, classPerm);
     }
 
-    private record Param(boolean sender, boolean optional, boolean sanitize, boolean greedy, Class<?> type, String name, Object defaultValue) {
-        static Param sender(Class<?> t) { return new Param(true, false, true, false, t, "", null); }
-        static Param required(Class<?> t, String n, boolean sanitize) { return new Param(false, false, sanitize, false, t, n, null); }
-        static Param greedy(Class<?> t, String n, boolean sanitize) { return new Param(false, false, sanitize, true, t, n, null); }
-        static Param optional(Class<?> t, String n, Object def, boolean sanitize) { return new Param(false, true, sanitize, false, t, n, def); }
+    private RequiredArgumentBuilder<CommandSourceStack, ?> createArgumentBuilder(String name, Param param) {
+        return treeBuilder.createArgumentBuilder(name, param);
     }
 
-    /** Per-root registration state, shared by every handler contributing to the root. */
-    private static final class RootSpec {
-        final LiteralArgumentBuilder<CommandSourceStack> builder;
-        final Set<String> classPerms = new LinkedHashSet<>();
-        final Map<String, String> routesSeen = new HashMap<>();
-        final Map<String, ArgKind> argKinds = new HashMap<>();
-        final Map<String, String> argChildAt = new HashMap<>();
-        boolean openAccess;
-        String description = "";
-
-        RootSpec(LiteralArgumentBuilder<CommandSourceStack> builder) {
-            this.builder = builder;
-        }
+    private SuggestionProvider<CommandSourceStack> createArgumentSuggestionProvider(Param param) {
+        return treeBuilder.createArgumentSuggestionProvider(param);
     }
 
-    private static class RouteBinding {
-        final Object instance;
-        final Method method;
-        final List<Segment> path;
-        final List<Param> params;
-        final String permission;
-        final String description;
-        final String rawPattern;
-        final boolean async;
+    private SuggestionProvider<CommandSourceStack> createFlagSuggestionProvider(RouteBinding binding) {
+        return treeBuilder.createFlagSuggestionProvider(binding);
+    }
 
-        RouteBinding(Object instance, Method method, List<Segment> path, List<Param> params,
-                     String permission, String description, String rawPattern) {
-            this.instance = instance;
-            this.method = method;
-            this.path = path;
-            this.params = params;
-            this.permission = permission;
-            this.description = description;
-            this.rawPattern = rawPattern;
-            this.method.setAccessible(true);
-            this.async = method.isAnnotationPresent(Async.class);
-        }
+    private void safeMsg(CommandSender sender, Component msg) {
+        errorRenderer.safeMsg(sender, msg);
     }
 }

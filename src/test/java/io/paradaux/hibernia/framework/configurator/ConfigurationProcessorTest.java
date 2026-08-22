@@ -7,6 +7,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.logging.Logger;
 
@@ -319,5 +320,58 @@ class ConfigurationProcessorTest {
 
         assertEquals("injected", target.annotated);
         assertEquals("original", target.unannotated);
+    }
+
+    // ── BigDecimal injection (ADT-57: exact money, never via double) ──────────
+
+    static class BigDecimalTarget {
+        @ConfigurationValue(path = "economy.starting-balance", defaultValue = "100.00")
+        BigDecimal startingBalance;
+    }
+
+    @Test
+    void process_injectsBigDecimalFromStringScalar() {
+        when(config.contains("economy.starting-balance")).thenReturn(true);
+        when(config.get("economy.starting-balance")).thenReturn("19.99");
+
+        BigDecimalTarget target = new BigDecimalTarget();
+        processor.process(target);
+
+        // Exact — proving it didn't round-trip through a double.
+        assertEquals(new BigDecimal("19.99"), target.startingBalance);
+    }
+
+    @Test
+    void process_injectsBigDecimalFromYamlNumber() {
+        when(config.contains("economy.starting-balance")).thenReturn(true);
+        when(config.get("economy.starting-balance")).thenReturn(2500);
+
+        BigDecimalTarget target = new BigDecimalTarget();
+        processor.process(target);
+
+        assertEquals(new BigDecimal("2500"), target.startingBalance);
+    }
+
+    @Test
+    void process_usesDefaultWhenPathAbsent_bigDecimal() {
+        when(config.contains("economy.starting-balance")).thenReturn(false);
+
+        BigDecimalTarget target = new BigDecimalTarget();
+        processor.process(target);
+
+        assertEquals(new BigDecimal("100.00"), target.startingBalance);
+    }
+
+    @Test
+    void process_invalidBigDecimal_logsPathAndField() {
+        when(config.contains("economy.starting-balance")).thenReturn(true);
+        when(config.get("economy.starting-balance")).thenReturn("not-money");
+
+        BigDecimalTarget target = new BigDecimalTarget();
+        processor.process(target);
+
+        assertNull(target.startingBalance);
+        verify(logger).log(eq(java.util.logging.Level.WARNING),
+                contains("economy.starting-balance"), any(Throwable.class));
     }
 }

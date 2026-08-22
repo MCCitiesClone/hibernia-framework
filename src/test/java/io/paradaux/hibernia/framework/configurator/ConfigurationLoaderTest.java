@@ -86,21 +86,40 @@ class ConfigurationLoaderTest {
     }
 
     @Test
-    void reload_reReadsConfigIntoExistingComponentInstances() {
+    void reload_swapsInFreshlyPopulatedSnapshotAtomically() {
         when(config.contains("loader.value")).thenReturn(true);
         when(config.getString("loader.value", "fallback")).thenReturn("loaded", "reloaded");
 
         ConfigurationLoader loader = new ConfigurationLoader(plugin);
         loader.scanPackage("io.paradaux.hibernia.framework.configurator");
 
-        GoodComponent component = loader.getComponent(GoodComponent.class);
-        assertEquals("loaded", component.value);
+        GoodComponent first = loader.getComponent(GoodComponent.class);
+        assertEquals("loaded", first.value);
 
         loader.reload();
 
         verify(plugin).reloadConfig();
-        // Same instance, new value — bound singletons see the change.
-        assertSame(component, loader.getComponent(GoodComponent.class));
-        assertEquals("reloaded", component.value);
+        GoodComponent afterReload = loader.getComponent(GoodComponent.class);
+        // A fresh instance is published atomically; the snapshot reflects the reload.
+        assertNotSame(first, afterReload);
+        assertEquals("reloaded", afterReload.value);
+        // The previously captured reference is a consistent stale snapshot, never torn.
+        assertEquals("loaded", first.value);
+    }
+
+    @Test
+    void reload_keepsLoadedComponentsPresent() {
+        when(config.contains("loader.value")).thenReturn(true);
+        when(config.getString("loader.value", "fallback")).thenReturn("loaded");
+
+        ConfigurationLoader loader = new ConfigurationLoader(plugin);
+        loader.scanPackage("io.paradaux.hibernia.framework.configurator");
+        assertEquals("loaded", loader.getComponent(GoodComponent.class).value);
+
+        loader.reload();
+
+        // The component survives a reload and stays resolvable from the new snapshot.
+        assertNotNull(loader.getComponent(GoodComponent.class));
+        assertTrue(loader.getComponents().containsKey(GoodComponent.class));
     }
 }

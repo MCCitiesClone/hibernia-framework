@@ -3,11 +3,12 @@ plugins {
     `maven-publish`
     jacoco
     id("com.gradleup.shadow") version "9.0.2"
+    id("com.github.spotbugs") version "6.0.26"
 }
 
 group = "io.paradaux"
 version = providers.gradleProperty("version")
-    .orElse("1.1.0-SNAPSHOT")
+    .orElse("1.2.0-SNAPSHOT")
     .get()
 
 java {
@@ -29,6 +30,7 @@ repositories {
 
 dependencies {
     // Paper & MC-Specific dependencies
+    // Kept in step with the consumer plugins' Paper line (gradle/libs.versions.toml in the monorepo).
     compileOnly("io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT")
 
     // DI — api, not implementation: the public surface exposes Guice types
@@ -73,6 +75,47 @@ tasks.jacocoTestReport {
         html.required.set(true)
         csv.required.set(false)
     }
+}
+
+// Coverage gate (ADT-63). A no-regression floor wired into `check`, ratcheted up as the
+// per-area coverage work lands. The Paper-coupled renderer needs a running server to
+// exercise, so it is the one documented exclusion — every renderer-agnostic class stays in scope.
+tasks.jacocoTestCoverageVerification {
+    dependsOn(tasks.test)
+    // The Paper-coupled renderer needs a running server, so drop it from the analysed
+    // classes (the same way Treasury excludes its Bukkit glue from the gate).
+    classDirectories.setFrom(
+        files(classDirectories.files.map {
+            fileTree(it) { exclude("io/paradaux/hibernia/framework/usher/render/PaperDialogRenderer*") }
+        })
+    )
+    violationRules {
+        rule {
+            element = "BUNDLE"
+            limit {
+                counter = "LINE"
+                value = "COVEREDRATIO"
+                minimum = "0.95".toBigDecimal()
+            }
+            limit {
+                counter = "BRANCH"
+                value = "COVEREDRATIO"
+                minimum = "0.83".toBigDecimal()
+            }
+        }
+    }
+}
+tasks.check { dependsOn(tasks.jacocoTestCoverageVerification) }
+
+// Static analysis (ADT-61). Non-failing to begin with — the value is the report; ratchet to
+// fail-on-new once the existing findings are triaged.
+spotbugs {
+    ignoreFailures.set(true)
+    showStackTraces.set(false)
+}
+tasks.withType<com.github.spotbugs.snom.SpotBugsTask>().configureEach {
+    reports.create("html") { required.set(true) }
+    reports.create("xml") { required.set(false) }
 }
 
 /**

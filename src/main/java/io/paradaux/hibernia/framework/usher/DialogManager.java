@@ -14,6 +14,7 @@ import io.paradaux.hibernia.framework.exceptions.NoPermissionException;
 import io.paradaux.hibernia.framework.exceptions.NotFoundException;
 import io.paradaux.hibernia.framework.i18n.Message;
 import io.paradaux.hibernia.framework.usher.annotations.Action;
+import io.paradaux.hibernia.framework.usher.annotations.ActionArg;
 import io.paradaux.hibernia.framework.usher.annotations.Dialog;
 import io.paradaux.hibernia.framework.usher.annotations.Input;
 import io.paradaux.hibernia.framework.usher.annotations.Model;
@@ -198,7 +199,7 @@ public class DialogManager {
                     case CLOSE -> flow.close();
                     case BACK -> flow.back();
                     case OPEN -> flow.open(button.target());
-                    case ACTION -> dispatchAction(flow, button.target(), view);
+                    case ACTION -> dispatchAction(flow, button.target(), button.argument(), view);
                 }
             } catch (Exception e) {
                 renderError(flow.player(), e, requireHandler(flow.handlerType()), "button " + button.kind());
@@ -206,7 +207,8 @@ public class DialogManager {
         };
     }
 
-    private void dispatchAction(DialogFlow flow, String actionName, DialogResponseView view) {
+    private void dispatchAction(DialogFlow flow, String actionName, String argument,
+                                DialogResponseView view) {
         HandlerModel hm = requireHandler(flow.handlerType());
         Method method = hm.actions.get(actionName);
         if (method == null) {
@@ -216,7 +218,7 @@ public class DialogManager {
         }
         DialogContext ctx = new DialogContext(view, flow);
         try {
-            Object[] args = injectParams(hm, method, flow, ctx);
+            Object[] args = injectParams(hm, method, flow, ctx, argument);
             method.invoke(hm.instance, args);
         } catch (InvocationTargetException ite) {
             renderError(flow.player(), ite.getTargetException(), hm, "action " + actionName);
@@ -228,15 +230,28 @@ public class DialogManager {
     // ── parameter injection ───────────────────────────────────────────────────────
 
     private Object[] injectParams(HandlerModel hm, Method method, DialogFlow flow, DialogContext ctx) {
+        return injectParams(hm, method, flow, ctx, null);
+    }
+
+    private Object[] injectParams(HandlerModel hm, Method method, DialogFlow flow, DialogContext ctx,
+                                  String argument) {
         Parameter[] params = method.getParameters();
         Object[] args = new Object[params.length];
         for (int i = 0; i < params.length; i++) {
-            args[i] = injectParam(hm, method, params[i], flow, ctx);
+            args[i] = injectParam(hm, method, params[i], flow, ctx, argument);
         }
         return args;
     }
 
-    private Object injectParam(HandlerModel hm, Method method, Parameter param, DialogFlow flow, DialogContext ctx) {
+    private Object injectParam(HandlerModel hm, Method method, Parameter param, DialogFlow flow,
+                               DialogContext ctx, String argument) {
+        if (param.isAnnotationPresent(ActionArg.class)) {
+            if (ctx == null) {
+                throw new IllegalStateException("@ActionArg parameter is only valid on an @Action ("
+                        + method + ")");
+            }
+            return coerceActionArg(argument, param.getType(), method);
+        }
         Input input = param.getAnnotation(Input.class);
         if (input != null) {
             if (ctx == null) {
@@ -263,7 +278,44 @@ public class DialogManager {
             return flow.player();
         }
         throw new IllegalStateException("Unsupported parameter " + param.getType().getSimpleName() + " on " + method
-                + " — annotate with @Input/@Model or use DialogFlow/DialogContext/Player/Message");
+                + " — annotate with @Input/@Model/@ActionArg or use DialogFlow/DialogContext/Player/Message");
+    }
+
+    /** Converts a button's argument string to the {@code @ActionArg} parameter's declared type. */
+    private static Object coerceActionArg(String argument, Class<?> type, Method method) {
+        if (argument == null) {
+            if (type.isPrimitive()) {
+                throw new IllegalArgumentException("Button supplied no argument but @ActionArg is primitive "
+                        + type.getSimpleName() + " on " + method);
+            }
+            return null;
+        }
+        if (type == String.class) {
+            return argument;
+        }
+        if (type == int.class || type == Integer.class) {
+            return Integer.valueOf(argument.trim());
+        }
+        if (type == long.class || type == Long.class) {
+            return Long.valueOf(argument.trim());
+        }
+        if (type == double.class || type == Double.class) {
+            return Double.valueOf(argument.trim());
+        }
+        if (type == boolean.class || type == Boolean.class) {
+            return Boolean.valueOf(argument.trim());
+        }
+        if (type.isEnum()) {
+            for (Object constant : type.getEnumConstants()) {
+                if (((Enum<?>) constant).name().equalsIgnoreCase(argument)) {
+                    return constant;
+                }
+            }
+            throw new IllegalArgumentException("Invalid @ActionArg value '" + argument + "' for "
+                    + type.getSimpleName() + " on " + method);
+        }
+        throw new IllegalStateException("Unsupported @ActionArg type " + type.getSimpleName()
+                + " on " + method);
     }
 
     private Object readInput(String key, Class<?> type, DialogResponseView view) {

@@ -57,8 +57,12 @@ exceptions, utils and the HiberniaModule bootstrap.
 
 ## Linting / Static Analysis
 
-No linting or static analysis tools are configured (no Checkstyle, SpotBugs, PMD,
-or Error Prone). The compiler with Java 21 toolchain is the only validation.
+SpotBugs is configured (`com.github.spotbugs` Gradle plugin) and runs as part of
+`check`, currently **non-failing** (`spotbugs.ignoreFailures = true`) — the value is
+the HTML report under `build/reports/spotbugs/`; ratchet to fail-on-new once findings
+are triaged. No Checkstyle/PMD/Error Prone. JaCoCo enforces a coverage gate via
+`jacocoTestCoverageVerification` (wired into `check`); the Paper-coupled
+`usher/render/PaperDialogRenderer` is the one documented exclusion.
 
 ## CI/CD
 
@@ -102,7 +106,7 @@ src/main/java/io/paradaux/hibernia/framework/
 
 ## Key Dependencies
 
-- `io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT` (compileOnly)
+- `io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT` (compileOnly)
 - `com.google.inject:guice:7.0.0` (DI — `api` scope: HiberniaModule/CommandManager expose Guice types)
 - `com.google.guava:guava:33.2.1-jre`
 - `org.reflections:reflections:0.10.2` (classpath scanning)

@@ -68,15 +68,18 @@ jobs:
           echo "version=$PUBLISH_VERSION" >> $GITHUB_OUTPUT
           echo "Will publish version: $PUBLISH_VERSION"
 
-      - name: Run tests
-        run: ./gradlew --no-daemon test
+      - name: Run tests + coverage gate
+        run: ./gradlew --no-daemon test jacocoTestReport jacocoTestCoverageVerification
 
-      - name: Upload test report
+      - name: Upload test & coverage reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-report
-          path: build/reports/tests/test/
+          path: |
+            build/reports/tests/test/
+            build/reports/jacoco/
+            build/test-results/
 
       - name: Build & publish
         run: ./gradlew --no-daemon clean build publish -Pversion=${{ steps.pick.outputs.version }}

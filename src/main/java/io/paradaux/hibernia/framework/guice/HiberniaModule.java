@@ -7,6 +7,7 @@ import io.paradaux.hibernia.framework.commander.spi.CommandHandler;
 import io.paradaux.hibernia.framework.commander.spi.ParameterResolver;
 import io.paradaux.hibernia.framework.configurator.ConfigurationLoader;
 import io.paradaux.hibernia.framework.i18n.Message;
+import io.paradaux.hibernia.framework.upgrade.DefaultsReconciler;
 import io.paradaux.hibernia.framework.i18n.PapiSupport;
 import io.paradaux.hibernia.framework.i18n.PlaceholderApiSupport;
 import io.paradaux.hibernia.framework.usher.render.DialogRenderer;
@@ -87,6 +88,14 @@ public final class HiberniaModule extends AbstractModule {
         this.bedrockSupport = builder.bedrockSupport;
         this.papiSupport = builder.papiSupport;
         this.bindMessage = builder.bindMessage;
+
+        // Fill in any config.yml / messages.properties keys a new release added, before the
+        // ConfigurationLoader (saveDefaultConfig) and Message (ensureDefaultFile + reload) below
+        // read those files — so they load the freshly merged content.
+        if (builder.reconcileDefaults) {
+            DefaultsReconciler.reconcile(plugin);
+        }
+
         this.configurationLoader = new ConfigurationLoader(plugin);
         builder.configurationPackages.forEach(configurationLoader::scanPackage);
     }
@@ -165,6 +174,7 @@ public final class HiberniaModule extends AbstractModule {
         private Class<? extends BedrockSupport> bedrockSupport;
         private Class<? extends PapiSupport> papiSupport = PlaceholderApiSupport.class;
         private boolean bindMessage = true;
+        private boolean reconcileDefaults = true;
 
         private Builder(JavaPlugin plugin) {
             this.plugin = Objects.requireNonNull(plugin, "plugin");
@@ -237,6 +247,16 @@ public final class HiberniaModule extends AbstractModule {
          */
         public Builder withoutMessages() {
             this.bindMessage = false;
+            return this;
+        }
+
+        /**
+         * Skip the on-upgrade reconciliation that fills new jar-default keys into the
+         * operator's existing {@code config.yml} / {@code messages.properties}
+         * (see {@link DefaultsReconciler}). Reconciliation is additive and on by default.
+         */
+        public Builder withoutDefaultsReconciliation() {
+            this.reconcileDefaults = false;
             return this;
         }
 

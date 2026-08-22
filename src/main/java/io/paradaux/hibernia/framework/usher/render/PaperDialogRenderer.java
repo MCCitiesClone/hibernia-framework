@@ -51,6 +51,10 @@ public final class PaperDialogRenderer implements DialogRenderer {
     private DialogBase base(DialogView view, Function<Text, Component> text) {
         DialogBase.Builder builder = DialogBase.builder(text.apply(view.title()))
                 .canCloseWithEscape(view.canCloseWithEscape())
+                // Never pause the game: a server dialog can't pause it anyway, and Paper rejects a
+                // pausing dialog whose after_action doesn't unpause (e.g. the NONE default), which would
+                // otherwise make every multiAction/notice screen throw at render time.
+                .pause(false)
                 .afterAction(afterAction(view.afterAction()));
         if (view.externalTitle() != null) {
             builder.externalTitle(text.apply(view.externalTitle()));

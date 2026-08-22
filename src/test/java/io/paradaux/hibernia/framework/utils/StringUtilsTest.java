@@ -155,4 +155,10 @@ class StringUtilsTest {
     void startsWithNumber_singleDigit_returnsTrue() {
         assertTrue(StringUtils.startsWithNumber("9"));
     }
+
+    @Test
+    void constructor_isInstantiable() {
+        // The class is a static utility holder; the default constructor exists but is unused.
+        assertNotNull(new StringUtils());
+    }
 }

@@ -114,6 +114,16 @@ public final class Message {
         return Set.copyOf(bundles.keySet());
     }
 
+    /** Whether any bundle in {@code locale}'s fallback chain defines {@code key}. */
+    public boolean has(Locale locale, String key) {
+        return findRaw(locale, key) != null;
+    }
+
+    /** Whether any bundle in {@code sender}'s locale chain defines {@code key}. */
+    public boolean has(CommandSender sender, String key) {
+        return findRaw(localeOf(sender), key) != null;
+    }
+
     /**
      * Mark a placeholder value as trusted MiniMessage markup: it is substituted verbatim (tags parsed,
      * braces expandable) instead of being escaped. Only use for values the operator controls — never for
