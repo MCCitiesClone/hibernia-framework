@@ -306,10 +306,13 @@ public class CommandManager {
 
     private Object[] extractArguments(CommandContext<CommandSourceStack> context, RouteBinding binding, CommandSender sender) throws Exception {
         List<Object> values = new ArrayList<>();
+        Map<String, String> flagValues = parseFlagTail(context, binding);
 
         for (Param param : binding.params) {
             if (param.sender) {
                 values.add(injectSender(param.type, sender));
+            } else if (param.flag) {
+                values.add(resolveFlag(binding, param, flagValues, sender));
             } else {
                 String argName = null;
                 for (Segment seg : binding.path) {
@@ -367,6 +370,65 @@ public class CommandManager {
         }
 
         return values.toArray();
+    }
+
+    /**
+     * Reads the greedy flag tail off the context and parses it. The node is optional, so an
+     * absent tail is the ordinary "no flags given" case and yields an empty map.
+     */
+    private Map<String, String> parseFlagTail(CommandContext<CommandSourceStack> context, RouteBinding binding) {
+        if (binding.flags.isEmpty()) {
+            return Map.of();
+        }
+        String raw;
+        try {
+            raw = context.getArgument(CommandTreeBuilder.FLAG_TAIL_ARG, String.class);
+        } catch (IllegalArgumentException absent) {
+            return Map.of();
+        }
+        return FlagTail.parse(raw, binding.flags);
+    }
+
+    /**
+     * Binds one {@code @Flag} parameter from the parsed tail, falling back to its declared
+     * default when the flag was not supplied. Presence flags answer the question "was it
+     * given?"; value flags resolve through the same resolver registry as positional arguments,
+     * so a flag and an {@code <arg>} of the same type accept exactly the same input.
+     */
+    private Object resolveFlag(RouteBinding binding, Param param, Map<String, String> flagValues,
+                               CommandSender sender) throws Exception {
+        FlagSpec found = null;
+        for (FlagSpec candidate : binding.flags) {
+            if (candidate.name.equals(param.name)) {
+                found = candidate;
+                break;
+            }
+        }
+        if (found == null) {
+            throw new IllegalStateException("No flag bound for parameter '" + param.name + "'");
+        }
+        final FlagSpec spec = found;
+
+        boolean supplied = flagValues.containsKey(spec.name);
+        if (spec.presence) {
+            return supplied;
+        }
+        if (!supplied) {
+            return resolveDefault(param, sender);
+        }
+
+        String raw = flagValues.get(spec.name);
+        if (!spec.sanitize && spec.type == String.class) {
+            return raw;
+        }
+
+        @SuppressWarnings("unchecked")
+        ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolverFor(spec.type);
+        if (resolver != null) {
+            return resolver.resolve(raw, sender)
+                    .orElseThrow(() -> new IllegalArgumentException("Invalid --" + spec.name + ": " + raw));
+        }
+        return raw;
     }
 
     private void registerResolver(ParameterResolver<?> r) {
@@ -499,6 +561,10 @@ public class CommandManager {
 
     private SuggestionProvider<CommandSourceStack> createArgumentSuggestionProvider(Param param) {
         return treeBuilder.createArgumentSuggestionProvider(param);
+    }
+
+    private SuggestionProvider<CommandSourceStack> createFlagSuggestionProvider(RouteBinding binding) {
+        return treeBuilder.createFlagSuggestionProvider(binding);
     }
 
     private void safeMsg(CommandSender sender, Component msg) {

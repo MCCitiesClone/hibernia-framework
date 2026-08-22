@@ -7,6 +7,7 @@ import com.mojang.brigadier.builder.ArgumentBuilder;
 import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
+import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import io.papermc.paper.command.brigadier.CommandSourceStack;
 import io.papermc.paper.command.brigadier.Commands;
 import io.paradaux.hibernia.framework.commander.arguments.BigDecimalArgumentType;
@@ -27,6 +28,13 @@ import java.util.function.Function;
  * tree-construction concerns, extracted from {@link CommandManager}.
  */
 final class CommandTreeBuilder {
+
+    /**
+     * Node name for the greedy tail that carries a flagged route's {@code --name value}
+     * segment. Chosen to be unusable as a route placeholder — {@code <hibernia$flags>} is not
+     * something a handler would declare — so it can never collide with a real argument.
+     */
+    static final String FLAG_TAIL_ARG = "hibernia$flags";
 
     /** Executes a bound route at dispatch time; wired back to {@code CommandManager#executeBinding}. */
     @FunctionalInterface
@@ -117,6 +125,7 @@ final class CommandTreeBuilder {
                      RouteBinding binding, int depth, String classPerm) {
         if (depth >= binding.path.size()) {
             parent.executes(ctx -> executor.execute(ctx, binding));
+            attachFlagTail(parent, binding);
             return;
         }
 
@@ -126,6 +135,7 @@ final class CommandTreeBuilder {
         // conflict checks have already guaranteed this executes slot is ours.
         if (segment.optionalArg() && parent.getCommand() == null) {
             parent.executes(ctx -> executor.execute(ctx, binding));
+            attachFlagTail(parent, binding);
         }
 
         ArgumentBuilder<CommandSourceStack, ?> child;
@@ -145,10 +155,75 @@ final class CommandTreeBuilder {
         }
         if (depth == binding.path.size() - 1) {
             child.executes(ctx -> executor.execute(ctx, binding));
+            attachFlagTail(child, binding);
         } else {
             addSegments(child, binding, depth + 1, classPerm);
         }
         parent.then(child);
+    }
+
+    /**
+     * Hangs the flag tail off a node at which {@code binding} is executable, so every
+     * executable path of a flagged route accepts its flags — including the truncations
+     * produced by omitting optional segments ({@code /x list --page 2} as well as
+     * {@code /x list spawn --page 2}).
+     *
+     * <p>One greedy node rather than a chain of literal/argument nodes: see {@link FlagTail}
+     * for why chaining is not viable.</p>
+     */
+    private void attachFlagTail(ArgumentBuilder<CommandSourceStack, ?> parent, RouteBinding binding) {
+        if (binding.flags.isEmpty()) {
+            return;
+        }
+        RequiredArgumentBuilder<CommandSourceStack, ?> tail =
+                Commands.argument(FLAG_TAIL_ARG, StringArgumentType.greedyString());
+        tail.suggests(createFlagSuggestionProvider(binding));
+        tail.executes(ctx -> executor.execute(ctx, binding));
+        parent.then(tail);
+    }
+
+    /**
+     * Completes the flag tail: flag names where a name belongs, and the flag's own resolver
+     * suggestions where a value belongs. Suggestions are anchored at the start of the token
+     * under the caret rather than at the start of the greedy node, so the client replaces just
+     * that token instead of the whole tail typed so far.
+     */
+    SuggestionProvider<CommandSourceStack> createFlagSuggestionProvider(RouteBinding binding) {
+        return (context, builder) -> {
+            CommandSender sender = context.getSource().getSender();
+            FlagTail.Completion completion = FlagTail.completionAt(builder.getRemaining(), binding.flags);
+            SuggestionsBuilder offset = builder.createOffset(builder.getStart() + completion.start());
+
+            if (completion.kind() == FlagTail.CompletionKind.FLAG_NAME) {
+                for (FlagSpec flag : binding.flags) {
+                    if (completion.usedNames().contains(flag.name)) {
+                        continue;
+                    }
+                    for (String name : flag.allNames()) {
+                        String token = "--" + name;
+                        if (token.startsWith(completion.prefix())) {
+                            offset.suggest(token);
+                        }
+                    }
+                }
+                return offset.buildFuture();
+            }
+
+            FlagSpec flag = completion.flag();
+            @SuppressWarnings("unchecked")
+            ParameterResolver<Object> resolver = (ParameterResolver<Object>) resolverLookup.apply(flag.type);
+            List<String> suggestions = resolver != null
+                    ? resolver.suggestions(completion.prefix(), sender)
+                    : List.of();
+            if (suggestions.isEmpty()) {
+                offset.suggest("<" + flag.name + ">");
+            } else {
+                for (String suggestion : suggestions) {
+                    offset.suggest(suggestion);
+                }
+            }
+            return offset.buildFuture();
+        };
     }
 
     RequiredArgumentBuilder<CommandSourceStack, ?> createArgumentBuilder(String name, Param param) {

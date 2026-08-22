@@ -19,10 +19,11 @@ class RouteBinding {
     final String permission;
     final String description;
     final String rawPattern;
+    final List<FlagSpec> flags;
     final boolean async;
 
     RouteBinding(Object instance, Method method, List<Segment> path, List<Param> params,
-                 String permission, String description, String rawPattern) {
+                 String permission, String description, String rawPattern, List<FlagSpec> flags) {
         this.instance = instance;
         this.method = method;
         this.path = path;
@@ -30,6 +31,7 @@ class RouteBinding {
         this.permission = permission;
         this.description = description;
         this.rawPattern = rawPattern;
+        this.flags = List.copyOf(flags);
         this.method.setAccessible(true);
         this.async = method.isAnnotationPresent(Async.class);
     }
