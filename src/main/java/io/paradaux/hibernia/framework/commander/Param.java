@@ -20,9 +20,12 @@ final class Param {
     final Class<?> type;
     final String name;
     final Object defaultValue;
+    final double min;
+    final double max;
 
     private Param(boolean sender, boolean optional, boolean sanitize, boolean greedy,
-                  boolean flag, Class<?> type, String name, Object defaultValue) {
+                  boolean flag, Class<?> type, String name, Object defaultValue,
+                  double min, double max) {
         this.sender = sender;
         this.optional = optional;
         this.sanitize = sanitize;
@@ -31,25 +34,44 @@ final class Param {
         this.type = type;
         this.name = name;
         this.defaultValue = defaultValue;
+        this.min = min;
+        this.max = max;
     }
 
     static Param sender(Class<?> t) {
-        return new Param(true, false, true, false, false, t, "", null);
+        return new Param(true, false, true, false, false, t, "", null,
+                Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
     }
 
+    static Param required(Class<?> t, String n, boolean sanitize, double min, double max) {
+        return new Param(false, false, sanitize, false, false, t, n, null, min, max);
+    }
+
+    /** Unbounded convenience forms; a numeric argument without an explicit range uses these. */
     static Param required(Class<?> t, String n, boolean sanitize) {
-        return new Param(false, false, sanitize, false, false, t, n, null);
-    }
-
-    static Param greedy(Class<?> t, String n, boolean sanitize) {
-        return new Param(false, false, sanitize, true, false, t, n, null);
+        return required(t, n, sanitize, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
     }
 
     static Param optional(Class<?> t, String n, Object def, boolean sanitize) {
-        return new Param(false, true, sanitize, false, false, t, n, def);
+        return optional(t, n, def, sanitize, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
     }
 
     static Param flag(Class<?> t, String n, boolean sanitize, Object def) {
-        return new Param(false, true, sanitize, false, true, t, n, def);
+        return flag(t, n, sanitize, def, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
+    }
+
+    static Param greedy(Class<?> t, String n, boolean sanitize) {
+        return new Param(false, false, sanitize, true, false, t, n, null,
+                Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
+    }
+
+    static Param optional(Class<?> t, String n, Object def, boolean sanitize,
+                          double min, double max) {
+        return new Param(false, true, sanitize, false, false, t, n, def, min, max);
+    }
+
+    static Param flag(Class<?> t, String n, boolean sanitize, Object def,
+                      double min, double max) {
+        return new Param(false, true, sanitize, false, true, t, n, def, min, max);
     }
 }

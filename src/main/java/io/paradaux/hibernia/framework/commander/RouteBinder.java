@@ -61,20 +61,22 @@ final class RouteBinder {
             else if (flag != null) {
                 FlagSpec spec = bindFlag(m, rp.getType(), flag);
                 flags.add(spec);
-                params.add(Param.flag(rp.getType(), spec.name, flag.sanitize(), spec.defaultValue));
+                params.add(Param.flag(rp.getType(), spec.name, flag.sanitize(), spec.defaultValue,
+                        flag.min(), flag.max()));
             }
             else if (greedy != null) {
                 foundGreedy = true;
                 params.add(Param.greedy(rp.getType(), greedy.value(), greedy.sanitize()));
             }
-            else if (arg != null) params.add(Param.required(rp.getType(), arg.value(), arg.sanitize()));
+            else if (arg != null) params.add(Param.required(rp.getType(), arg.value(), arg.sanitize(), arg.min(), arg.max()));
             else if (opt != null) {
                 if (rp.getType().isPrimitive() && opt.defaultValue().isEmpty()) {
                     throw new IllegalStateException("@OptionalArg(\"" + opt.value() + "\") on " + m
                             + " has a primitive type but no defaultValue; an omitted argument would be null."
                             + " Provide a defaultValue or use the boxed type.");
                 }
-                params.add(Param.optional(rp.getType(), opt.value(), opt.defaultValue(), opt.sanitize()));
+                params.add(Param.optional(rp.getType(), opt.value(), opt.defaultValue(), opt.sanitize(),
+                        opt.min(), opt.max()));
             }
             else throw new IllegalStateException("Parameter missing @Sender/@Arg/@OptionalArg/@GreedyArg/@Flag on " + m);
         }

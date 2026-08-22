@@ -14,6 +14,7 @@ import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import io.paradaux.hibernia.framework.commander.annotations.*;
 import io.paradaux.hibernia.framework.commander.resolvers.BigDecimalResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.BooleanResolver;
+import io.paradaux.hibernia.framework.commander.resolvers.DoubleResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.EnumResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.IntegerResolver;
 import io.paradaux.hibernia.framework.commander.resolvers.LongResolver;
@@ -141,6 +142,7 @@ public class CommandManager {
         registerResolver(new IntegerResolver());
         registerResolver(new LongResolver());
         registerResolver(new BigDecimalResolver());
+        registerResolver(new DoubleResolver());
         registerResolver(new BooleanResolver());
         registerResolver(new OfflinePlayerResolver());
 
@@ -360,7 +362,9 @@ public class CommandManager {
                                 values.add(resolver.resolve(stringValue, sender)
                                         .orElseThrow(() -> new IllegalArgumentException("Invalid " + param.name + ": " + stringValue)));
                             } else if (param.type == Integer.class || param.type == int.class
-                                    || param.type == Long.class || param.type == long.class) {
+                                    || param.type == Long.class || param.type == long.class
+                                    || param.type == Double.class || param.type == double.class
+                                    || param.type == Float.class || param.type == float.class) {
                                 // Brigadier's Integer/Long arg types deliver the
                                 // already-typed value; pass through.
                                 values.add(rawValue);

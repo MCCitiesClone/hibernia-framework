@@ -1,6 +1,8 @@
 package io.paradaux.hibernia.framework.commander;
 
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.builder.ArgumentBuilder;
+import com.mojang.brigadier.builder.RequiredArgumentBuilder;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.tree.CommandNode;
@@ -96,6 +98,10 @@ class CommandFlagTest {
 
         @Route("plain")
         public void plain(@Sender CommandSender sender) {
+        }
+
+        @Route("bounded <page>")
+        public void bounded(@Arg(value = "page", min = 1, max = 100) int page) {
         }
     }
 
@@ -335,6 +341,36 @@ class CommandFlagTest {
         when(context.getArgument("region", Object.class)).thenThrow(new IllegalArgumentException("missing"));
 
         assertThrows(FlagTail.FlagSyntaxException.class, () -> extract(binding, context));
+    }
+
+    @Test
+    void numericBoundsReachTheBrigadierNode() throws Exception {
+        // The bound has to be on the node, not checked in the handler: that is what makes the
+        // client refuse the value instead of the server accepting and then rejecting it.
+        Method method = FlagHandler.class.getDeclaredMethod("bounded", int.class);
+        Object binding = bind(handler, method, "bounded <page>");
+        Object param = firstNonSenderParam(binding);
+
+        Object builder = invokePrivate("createArgumentBuilder",
+                new Class[]{String.class, param.getClass()}, "page", param);
+        RequiredArgumentBuilder<?, ?> arg = (RequiredArgumentBuilder<?, ?>) builder;
+        IntegerArgumentType type = (IntegerArgumentType) arg.getType();
+
+        assertEquals(1, type.getMinimum());
+        assertEquals(100, type.getMaximum());
+    }
+
+    private Object firstNonSenderParam(Object binding) throws Exception {
+        java.lang.reflect.Field params = binding.getClass().getDeclaredField("params");
+        params.setAccessible(true);
+        for (Object candidate : (List<?>) params.get(binding)) {
+            java.lang.reflect.Field sender = candidate.getClass().getDeclaredField("sender");
+            sender.setAccessible(true);
+            if (!(boolean) sender.get(candidate)) {
+                return candidate;
+            }
+        }
+        throw new IllegalStateException("no argument parameter");
     }
 
     // ── tree wiring ───────────────────────────────────────────────────────────────

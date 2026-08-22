@@ -1,5 +1,7 @@
 package io.paradaux.hibernia.framework.commander;
 
+import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.FloatArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.LongArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
@@ -226,15 +228,31 @@ final class CommandTreeBuilder {
         };
     }
 
+    /**
+     * The Brigadier node for one argument.
+     *
+     * <p>Numeric bounds from {@code @Arg}/{@code @OptionalArg} are applied here rather than
+     * checked in the handler, so the client rejects an out-of-range value before sending it —
+     * which is what makes {@code --page 0} or a negative price impossible to submit at all.</p>
+     */
     RequiredArgumentBuilder<CommandSourceStack, ?> createArgumentBuilder(String name, Param param) {
         if (param.type == Integer.class || param.type == int.class) {
-            return Commands.argument(name, IntegerArgumentType.integer());
+            return Commands.argument(name, IntegerArgumentType.integer(
+                    (int) Math.max(Integer.MIN_VALUE, Math.ceil(param.min)),
+                    (int) Math.min(Integer.MAX_VALUE, Math.floor(param.max))));
         } else if (param.type == Long.class || param.type == long.class) {
-            return Commands.argument(name, LongArgumentType.longArg());
+            return Commands.argument(name, LongArgumentType.longArg(
+                    (long) Math.max(Long.MIN_VALUE, Math.ceil(param.min)),
+                    (long) Math.min(Long.MAX_VALUE, Math.floor(param.max))));
         } else if (param.greedy) {
             return Commands.argument(name, StringArgumentType.greedyString());
         } else if (param.type == BigDecimal.class) {
             return Commands.argument(name, BigDecimalArgumentType.bigDecimal());
+        } else if (param.type == Double.class || param.type == double.class) {
+            return Commands.argument(name, DoubleArgumentType.doubleArg(param.min, param.max));
+        } else if (param.type == Float.class || param.type == float.class) {
+            return Commands.argument(name, FloatArgumentType.floatArg(
+                    (float) param.min, (float) param.max));
         } else {
             return Commands.argument(name, StringArgumentType.word());
         }
@@ -245,6 +263,8 @@ final class CommandTreeBuilder {
         if (param.type == Long.class || param.type == long.class) return ArgKind.LONG;
         if (param.greedy) return ArgKind.GREEDY;
         if (param.type == BigDecimal.class) return ArgKind.BIG_DECIMAL;
+        if (param.type == Double.class || param.type == double.class) return ArgKind.DOUBLE;
+        if (param.type == Float.class || param.type == float.class) return ArgKind.FLOAT;
         return ArgKind.WORD;
     }
 
