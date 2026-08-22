@@ -158,9 +158,22 @@ public class CommandManager {
      */
     public void registerAll() {
         LifecycleEventManager<Plugin> manager = plugin.getLifecycleManager();
-        manager.registerEventHandler(LifecycleEvents.COMMANDS, event -> {
-            final Commands commands = event.registrar();
+        manager.registerEventHandler(LifecycleEvents.COMMANDS, event -> register(event.registrar()));
+    }
 
+    /**
+     * Builds the command tree and registers it into {@code commands}.
+     *
+     * <p>Separate from {@link #registerAll()} so a consuming plugin can exercise this in a test.
+     * Route validation and conflict detection happen here, and a handler that fails them is logged
+     * and skipped so the rest still register — which makes those failures invisible on a live
+     * server unless someone reads the log. Driving this directly, against a stub registrar, is what
+     * lets a build catch them instead.</p>
+     *
+     * @param commands the registrar to register the built tree into
+     */
+    public void register(Commands commands) {
+        {
             Map<String, RootSpec> roots = new LinkedHashMap<>();
             List<RouteInfo> index = new ArrayList<>();
 
@@ -196,7 +209,7 @@ public class CommandManager {
             }
 
             this.routeIndex = List.copyOf(index);
-        });
+        }
     }
 
     /**

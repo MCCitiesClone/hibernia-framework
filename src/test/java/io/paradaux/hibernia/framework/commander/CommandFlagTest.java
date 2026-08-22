@@ -375,6 +375,19 @@ class CommandFlagTest {
                 "an unflagged route must not grow a flag tail");
     }
 
+    @Test
+    void registerBuildsTheTreeWithoutTheLifecycle() {
+        // register(Commands) is the seam a consuming plugin tests its own tree through; without it
+        // registerAll() needs a live Paper runtime to initialise LifecycleEvents.
+        Commands commands = mock(Commands.class);
+
+        manager.register(commands);
+
+        assertFalse(manager.routeIndex().isEmpty(), "no routes were indexed");
+        assertTrue(manager.routeIndex().stream().anyMatch(r -> "list [region]".equals(r.pattern())),
+                "the flagged route was not registered");
+    }
+
     // ── completion ────────────────────────────────────────────────────────────────
 
     @Test
