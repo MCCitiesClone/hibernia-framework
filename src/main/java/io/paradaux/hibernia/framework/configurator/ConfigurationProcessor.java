@@ -158,7 +158,22 @@ public class ConfigurationProcessor {
         Class<?> element = typeArgument(generic, 0);
         if (element == null || !isConfigurationObject(element)) {
             // Scalar list: Bukkit's getStringList is the historical behaviour and stays.
-            return section.getStringList(path);
+            List<String> raw = section.getStringList(path);
+            if (element == null || element == String.class || element == Object.class) {
+                return raw;
+            }
+            // A typed scalar list -- List<UUID>, List<Integer> and friends. getStringList alone
+            // hands back Strings, and erasure lets the record field hold them: nothing fails here,
+            // but every later lookup against the declared type silently misses. Coerce so the list
+            // actually contains what its type says it does.
+            List<Object> converted = new ArrayList<>(raw.size());
+            for (String value : raw) {
+                Object coerced = coerceElement(value, element, path);
+                if (coerced != null) {
+                    converted.add(coerced);
+                }
+            }
+            return converted;
         }
         List<?> raw = section.getList(path);
         if (raw == null) {
@@ -172,6 +187,50 @@ public class ConfigurationProcessor {
             }
         }
         return List.copyOf(bound);
+    }
+
+    /**
+     * Converts one entry of a scalar list to the list's declared element type. A value that cannot
+     * be converted is warned about and dropped rather than failing the whole component: one bad
+     * UUID in a long exemption list should not cost the operator every other entry.
+     */
+    private Object coerceElement(String value, Class<?> element, String path) {
+        if (value == null) {
+            return null;
+        }
+        String trimmed = value.trim();
+        try {
+            if (element == UUID.class) {
+                return UUID.fromString(trimmed);
+            } else if (element == Integer.class || element == int.class) {
+                return Integer.valueOf(trimmed);
+            } else if (element == Long.class || element == long.class) {
+                return Long.valueOf(trimmed);
+            } else if (element == Double.class || element == double.class) {
+                return Double.valueOf(trimmed);
+            } else if (element == Float.class || element == float.class) {
+                return Float.valueOf(trimmed);
+            } else if (element == Boolean.class || element == boolean.class) {
+                return Boolean.valueOf(trimmed);
+            } else if (element == BigDecimal.class) {
+                return new BigDecimal(trimmed);
+            } else if (element == Component.class) {
+                return MiniMessage.miniMessage().deserialize(value);
+            } else if (element.isEnum()) {
+                Object constant = matchEnum(element, trimmed);
+                if (constant == null) {
+                    throw new IllegalArgumentException(
+                            "expected one of " + Arrays.toString(element.getEnumConstants()));
+                }
+                return constant;
+            }
+        } catch (RuntimeException ex) {
+            plugin.getLogger().warning("Ignoring invalid " + element.getSimpleName() + " '" + value
+                    + "' in " + path + ": " + ex.getMessage());
+            return null;
+        }
+        // An element type the processor has no conversion for; hand back the raw text unchanged.
+        return value;
     }
 
     private Object readMap(ConfigurationSection section, String path, Type generic, Deque<Class<?>> stack) {
